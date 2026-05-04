@@ -34,6 +34,7 @@ const plottingTools  = require('./tools/plotting');
 const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
+const REPEAT_LOSS_BARS = 20; // block same dir+level re-entry within N bars of a loss
 
 class MarketReader {
 
@@ -217,6 +218,8 @@ class MarketReader {
         this.lastStrengthScore=5;
         this.lastThesisAgainst=0;
         this.sigBehavior=''; this.sigLevel='';
+        // Repeat-failed-setup guard: don't re-fire same dir+level shortly after a loss.
+        this.lastLossBar=-9999; this.lastLossDir=0; this.lastLossLevel='';
         this.entryBar=0; this.barsHeld=0; this.barsSinceSig=0;
         this.entryChartIdx=null;  // chart index at entry (for line rendering)
         this.results=[];
@@ -659,6 +662,7 @@ class MarketReader {
                 // 2026-04-30 → 2026-05-01 transition).
                 this.results=[];
                 this.pauseUntilBar=-1;
+                this.lastLossBar=-9999; this.lastLossDir=0; this.lastLossLevel='';
                 // Reset cooldown so the open can fire immediately if
                 // a setup presents. barsSinceSig was probably mid-cooldown
                 // at session change — don't carry that into the new session.
@@ -1958,6 +1962,13 @@ class MarketReader {
 
                     const losses = this.results.filter(r=>!r.win).length;
                     if(losses>=3) this.pauseUntilBar = bi + PAUSE_BARS;
+                    // Track the failing setup so we don't re-fire the same
+                    // direction at the same level type immediately after.
+                    if(!win){
+                        this.lastLossBar = bi;
+                        this.lastLossDir = pos;
+                        this.lastLossLevel = this.sigLevel || '';
+                    }
 
                     if(this.renderMap[this.entryBar]){
                         this.renderMap[this.entryBar].exitPnl = exitPnl;
@@ -2457,6 +2468,20 @@ class MarketReader {
                                         ? 'avg score too low ('+decision.totalScore+')'
                                         : '2-of-3 not at strong level';
                         sa.behaviorTried = decision.setupTag || '';
+                    }
+                }
+                if(decision.fire){
+                    const dir = decision.dir;
+                    // Repeat-failed-setup guard: same dir + same level type
+                    // within REPEAT_LOSS_BARS of a loss = skip. Stops the
+                    // "buy every dip into a level that just stopped me out"
+                    // pattern when a level keeps rejecting in one direction.
+                    const _lt2pre = nearLevel ? nearLevel.type : '';
+                    if(this.lastLossDir === dir &&
+                       this.lastLossLevel && this.lastLossLevel === _lt2pre &&
+                       (bi - this.lastLossBar) < REPEAT_LOSS_BARS){
+                        decision.fire = false;
+                        this.blockReason = 'REPEAT-LOSS';
                     }
                 }
                 if(decision.fire){

@@ -34,7 +34,7 @@ const plottingTools  = require('./tools/plotting');
 const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
-const REPEAT_LOSS_BARS = 20; // block same dir+level re-entry within N bars of a loss
+const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)
 
 class MarketReader {
 
@@ -2508,6 +2508,33 @@ class MarketReader {
                        (bi - this.lastLossBar) < REPEAT_LOSS_BARS){
                         decision.fire = false;
                         this.blockReason = 'REPEAT-LOSS';
+                    }
+                    // Chase filter: block entries at the wrong end of a fresh
+                    // extended move. A SHORT near the bottom of a >6 ATR
+                    // 15-bar range, or a LONG near the top, means the move
+                    // already happened — you're paying premium for what's
+                    // already paid out. Today's 11:15 SHORT @ 27738 fired
+                    // after a 200pt drop and immediately reversed; this
+                    // would have caught it.
+                    if(decision.fire){
+                        const _chaseLB = 15;
+                        let _hi = h, _lo = l;
+                        for(let i = 1; i <= _chaseLB && (n-1-i) >= 0; i++){
+                            const _hi_i = this.H[n-1-i], _lo_i = this.L[n-1-i];
+                            if(_hi_i > _hi) _hi = _hi_i;
+                            if(_lo_i < _lo) _lo = _lo_i;
+                        }
+                        const _rng = _hi - _lo;
+                        if(_rng > atr * 6){
+                            const _posInRng = (c - _lo) / Math.max(_rng, 0.01);
+                            if(dir === -1 && _posInRng < 0.30){
+                                decision.fire = false;
+                                this.blockReason = 'CHASE-DOWN';
+                            } else if(dir === 1 && _posInRng > 0.70){
+                                decision.fire = false;
+                                this.blockReason = 'CHASE-UP';
+                            }
+                        }
                     }
                     // Regime-flip override: when at MAX-TRADES, allow ONE extra
                     // trade if it's the opposite direction of recent losses and

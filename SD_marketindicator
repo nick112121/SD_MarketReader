@@ -568,38 +568,7 @@ class MarketReader {
                 if(_b.n > 200){ _b.n = 100; _b.sumRange /= 2; }
             }
 
-            // ── INITIAL BALANCE (NY first 60 min) ────────────────────
-            // The opening hour sets the day's character. A clean break
-            // and hold (3+ bars) of IB high or low marks a trend day,
-            // and counter-trend setups get blocked for the rest of the
-            // session via the IB-COUNTER filter. Cheap, fast, decisive
-            // — doesn't wait for swing-based mktState to catch up.
-            if(isNewBar && sessSuffix === '_ny'){
-                if(this.ibStartBar < 0){
-                    this.ibStartBar = bi;
-                    this.ibHigh = h; this.ibLow = l;
-                    this.ibLocked = false; this.ibBroken = 0; this.ibBreakBars = 0;
-                }
-                const _ibAge = bi - this.ibStartBar;
-                if(_ibAge <= 60){
-                    if(h > this.ibHigh) this.ibHigh = h;
-                    if(l < this.ibLow)  this.ibLow  = l;
-                } else {
-                    if(!this.ibLocked) this.ibLocked = true;
-                    if(this.ibBroken === 0){
-                        const _buf = atr * 0.3;
-                        if(c > this.ibHigh + _buf){
-                            this.ibBreakBars++;
-                            if(this.ibBreakBars >= 3) this.ibBroken = 1;
-                        } else if(c < this.ibLow - _buf){
-                            this.ibBreakBars++;
-                            if(this.ibBreakBars >= 3) this.ibBroken = -1;
-                        } else {
-                            this.ibBreakBars = 0;
-                        }
-                    }
-                }
-            }
+            // (IB tracking moved below to after sessSuffix is computed)
 
             // ── DETERMINISTIC AVGVOL SEEDING ─────────────────────────
             // Same: only push on new bars. Tick updates evolve the live
@@ -781,6 +750,39 @@ class MarketReader {
             } else if(isNewBar) {
                 if(h>this.sessHigh) this.sessHigh=h;
                 if(l<this.sessLow)  this.sessLow=l;
+            }
+
+            // ── INITIAL BALANCE (NY first 60 min) ────────────────────
+            // The opening hour sets the day's character. A clean break
+            // and hold (3+ bars) of IB high or low marks a trend day,
+            // and counter-trend setups get blocked for the rest of the
+            // session via the IB-COUNTER filter. Cheap, fast, decisive
+            // — doesn't wait for swing-based mktState to catch up.
+            if(isNewBar && sessSuffix === '_ny'){
+                if(this.ibStartBar < 0){
+                    this.ibStartBar = bi;
+                    this.ibHigh = h; this.ibLow = l;
+                    this.ibLocked = false; this.ibBroken = 0; this.ibBreakBars = 0;
+                }
+                const _ibAge = bi - this.ibStartBar;
+                if(_ibAge <= 60){
+                    if(h > this.ibHigh) this.ibHigh = h;
+                    if(l < this.ibLow)  this.ibLow  = l;
+                } else {
+                    if(!this.ibLocked) this.ibLocked = true;
+                    if(this.ibBroken === 0){
+                        const _buf = atr * 0.3;
+                        if(c > this.ibHigh + _buf){
+                            this.ibBreakBars++;
+                            if(this.ibBreakBars >= 3) this.ibBroken = 1;
+                        } else if(c < this.ibLow - _buf){
+                            this.ibBreakBars++;
+                            if(this.ibBreakBars >= 3) this.ibBroken = -1;
+                        } else {
+                            this.ibBreakBars = 0;
+                        }
+                    }
+                }
             }
 
             // VWAP accumulates ONCE per bar (on isNewBar). Tick updates

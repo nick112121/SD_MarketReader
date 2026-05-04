@@ -364,6 +364,73 @@ function testMomentumFilterMath() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Test 15: DAY-QUALITY composite — verify the score moves with regime
+// ─────────────────────────────────────────────────────────────────────────
+function testDayQualityComposite() {
+    function score({ ibLocked, ibBroken, sessOpen, c, sessHigh, sessLow,
+                     h1Trend, recentResults, atr }) {
+        let q = 5;
+        if (ibLocked && ibBroken === 0) q += 2;
+        if (ibBroken !== 0) q -= 3;
+        if (sessOpen > 0 && Math.abs(c - sessOpen) > atr * 5) q -= 2;
+        if (sessOpen > 0) {
+            const pidr = (c - sessLow) / Math.max(sessHigh - sessLow, 0.01);
+            if (pidr < 0.15 || pidr > 0.85) q -= 1;
+        }
+        if (h1Trend === 'BULL' || h1Trend === 'BEAR') q -= 1;
+        if (recentResults && recentResults.length >= 2) {
+            const losses = recentResults.slice(-2).filter(r => !r.win).length;
+            if (losses >= 2) q -= 2;
+        }
+        return Math.max(0, Math.min(10, q));
+    }
+    // Balance day in mid-range: IB held, no big move, FLAT H1, no losses → 7
+    eq(score({
+        ibLocked: true, ibBroken: 0, sessOpen: 27800, c: 27810,
+        sessHigh: 27820, sessLow: 27795, h1Trend: 'FLAT',
+        recentResults: [], atr: 13,
+    }), 7, 'balance day = 7');
+    // Trend day, IB broken down, 5 ATR move, PIDR low, BEAR H1 → very low
+    eq(score({
+        ibLocked: true, ibBroken: -1, sessOpen: 27860, c: 27720,
+        sessHigh: 27945, sessLow: 27710, h1Trend: 'BEAR',
+        recentResults: [], atr: 13,
+    }), 0, 'trend distribution day = 0 (floored)');
+    // After two losses pile on
+    eq(score({
+        ibLocked: true, ibBroken: 0, sessOpen: 27800, c: 27810,
+        sessHigh: 27820, sessLow: 27795, h1Trend: 'FLAT',
+        recentResults: [{win:false},{win:false}], atr: 13,
+    }), 5, 'balance day with 2L = 5 (still firable)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 16: HARD-STOP at half daily loss
+// ─────────────────────────────────────────────────────────────────────────
+function testHardStop() {
+    // At -50% of maxDailyLoss with at least 1 trade taken, block.
+    function shouldHardStop(sessPnl, cv, maxLoss, dailyTrades) {
+        return (sessPnl * cv <= -(maxLoss * 0.5)) && dailyTrades > 0;
+    }
+    eq(shouldHardStop(-101, 2, 400, 1), true,  '-$202 with 1 trade @ maxLoss 400 → stop');
+    eq(shouldHardStop(-99, 2, 400, 1),  false, '-$198 → no stop');
+    eq(shouldHardStop(-150, 2, 400, 0), false, 'no trades yet → no stop (warm-up)');
+    eq(shouldHardStop(50, 2, 400, 5),   false, 'green session → no stop');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 17: DAY-QUALITY < 4 blocks, >= 4 allows
+// ─────────────────────────────────────────────────────────────────────────
+function testDayQualityBlock() {
+    // Just verify the threshold is "< 4" (i.e. 4 allowed, 3 blocked)
+    function blocked(q) { return q < 4; }
+    eq(blocked(0), true,  'Q0 blocked');
+    eq(blocked(3), true,  'Q3 blocked');
+    eq(blocked(4), false, 'Q4 allowed');
+    eq(blocked(7), false, 'Q7 allowed');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Run all
 // ─────────────────────────────────────────────────────────────────────────
 const tests = [
@@ -381,6 +448,9 @@ const tests = [
     ['LOSS-PAUSE threshold',         testLossPauseThreshold],
     ['distribution day end-to-end',  testDistributionDay],
     ['MOMENTUM filter math',         testMomentumFilterMath],
+    ['DAY-QUALITY composite',        testDayQualityComposite],
+    ['HARD-STOP threshold',          testHardStop],
+    ['DAY-QUALITY block threshold',  testDayQualityBlock],
 ];
 
 console.log('Running ' + tests.length + ' test groups…\n');

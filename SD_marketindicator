@@ -2399,6 +2399,68 @@ class MarketReader {
             // ─────────────────────────────────────────────────────────
             // SIGNAL GENERATION
             // ─────────────────────────────────────────────────────────
+            // ── DAY-QUALITY composite (0-10) ─────────────────────────
+            // Aggregates the regime signals the indicator is reading
+            // into a single number. Used as a master gate: when the
+            // day looks structurally hostile to mean-reversion (low
+            // quality), refuse all setups regardless of setup score.
+            // Also surfaced in HUD so the user can see WHY trades are
+            // being held back.
+            let dayQuality = 5;            // neutral
+            const _dqReasons = [];
+            // IB unbroken + held → +2 (balance day character)
+            if(this.ibLocked && this.ibBroken === 0){
+                dayQuality += 2; _dqReasons.push('IB-HELD');
+            }
+            // IB broken → -3 (trend day character, mean-reversion fragile)
+            if(this.ibBroken !== 0){
+                dayQuality -= 3; _dqReasons.push('IB-BROKEN');
+            }
+            // Strong directional day move (>5 ATR) → -2
+            if(this.sessOpen > 0){
+                const _dMv  = Math.abs(c - this.sessOpen);
+                if(_dMv > atr * 5){
+                    dayQuality -= 2; _dqReasons.push('DAY-DIRECTIONAL');
+                }
+            }
+            // PIDR in extreme zone (<15% or >85%) → -1
+            if(this.sessOpen > 0){
+                const _pidr = (c - this.sessLow) /
+                    Math.max(this.sessHigh - this.sessLow, 0.01);
+                if(_pidr < 0.15 || _pidr > 0.85){
+                    dayQuality -= 1; _dqReasons.push('PIDR-EXTREME');
+                }
+            }
+            // H1 trending → -1 (mean-reversion fights HTF)
+            if(this.h1Trend === 'BULL' || this.h1Trend === 'BEAR'){
+                dayQuality -= 1; _dqReasons.push('H1-TRENDING');
+            }
+            // Recent loss streak → -2 (something is structurally off)
+            if(this.results && this.results.length >= 2){
+                const _recentL = this.results.slice(-2).filter(r=>!r.win).length;
+                if(_recentL >= 2){ dayQuality -= 2; _dqReasons.push('LOSS-STREAK'); }
+            }
+            // Low recent momentum (last 20 bars net move < 1.5 ATR) → +1
+            // This keeps balance/chop days firmly above the master block
+            // threshold so genuine fade setups can fire.
+            if(n >= 21){
+                const _refC = this.C[n - 21];
+                if(_refC != null && Math.abs(c - _refC) < atr * 1.5){
+                    dayQuality += 1; _dqReasons.push('LOW-MOMENTUM');
+                }
+            }
+            // Floor + ceiling
+            dayQuality = Math.max(0, Math.min(10, dayQuality));
+            this.dayQuality = dayQuality;
+            this.dayQualityReasons = _dqReasons;
+
+            // ── HARD-STOP: half-loss kill switch ─────────────────────
+            // If session P&L drops below half of maxDailyLoss, refuse
+            // any further trades. Better to take a small loss day than
+            // give the system rope to hang itself with revenge trades.
+            const _halfLossHit = this.sessPnl * cv <= -(maxLoss * 0.5)
+                                  && this.dailyTrades > 0;
+
             let blockReason = '';
             if(!timeOK)                                blockReason='TIME';
             else if(this.position!==0)                 blockReason='IN-POS';
@@ -2407,6 +2469,8 @@ class MarketReader {
             else if(bi<=this.pauseUntilBar)            blockReason='LOSS-PAUSE';
             else if(this.barsSinceSig<=5)              blockReason='COOLDOWN';
             else if(this.sessPnl*cv<=-maxLoss)         blockReason='MAX-LOSS';
+            else if(_halfLossHit)                      blockReason='HARD-STOP';
+            else if(dayQuality < 4)                    blockReason='DAY-QUALITY';
             else if(!(atLevel||isSweepEntry))          blockReason='NO-LEVEL';
             this.blockReason = blockReason;
             // Allow decision eval to proceed when the only block is MAX-TRADES
@@ -3152,11 +3216,13 @@ class MarketReader {
                         const _cdTag = Math.abs(_cd) >= 100
                             ? '  CD '+(_cd>0?'+':'')+_cd.toFixed(0)
                             : '';
+                        const _dq    = (this.dayQuality != null) ? this.dayQuality : 5;
+                        const _dqTag = '  Q'+_dq.toFixed(0)+'/10';
                         const _dayText = 'DAY '+_dDir+' '+
                             (_dMv>=0?'+':'')+_dMv.toFixed(1)+
                             '  rng '+_dRng.toFixed(0)+
                             '  PIDR '+(_PIDR*100).toFixed(0)+'%'+
-                            _ibTag + _h1Tag + _cdTag;
+                            _ibTag + _h1Tag + _cdTag + _dqTag;
                         _items.push({tag:'Text', key:'sm_day_ctx',
                             text: _dayText,
                             point:{x:_px, y:du(c+atr*0.9)},

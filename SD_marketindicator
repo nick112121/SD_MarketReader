@@ -220,6 +220,12 @@ class MarketReader {
         this.sigBehavior=''; this.sigLevel='';
         // Repeat-failed-setup guard: don't re-fire same dir+level shortly after a loss.
         this.lastLossBar=-9999; this.lastLossDir=0; this.lastLossLevel='';
+        // Regime-flip override: one extra trade allowed past MAX-TRADES if the
+        // setup is opposite-direction high-conviction (per session).
+        this.maxTradesOverrideUsed = false;
+        // Volatility-by-hour profile: rolling avg range per 15-min bucket.
+        // Accumulates across sessions so hot windows emerge over time.
+        this.volBins = {};
         this.entryBar=0; this.barsHeld=0; this.barsSinceSig=0;
         this.entryChartIdx=null;  // chart index at entry (for line rendering)
         this.results=[];
@@ -540,6 +546,20 @@ class MarketReader {
             // (On tick updates, this.atr stays stable from previous bar close.)
             const atr = Math.max(this.atr, this.atrFloor);
 
+            // ── VOLATILITY-BY-HOUR PROFILE ───────────────────────────
+            // Bucket the bar's range into a 15-min bin. Over time the
+            // bins reveal the windows where the day's big moves usually
+            // happen (e.g. NY 09:45, 11:00). Surfaced in HUD as "HOT".
+            if(isNewBar && n > 1){
+                const _bm = Math.floor(bLtm/15)*15;
+                const _bin = (bLth<10?'0':'')+bLth+':'+(_bm<10?'0':'')+_bm;
+                if(!this.volBins[_bin]) this.volBins[_bin] = {n:0, sumRange:0};
+                const _b = this.volBins[_bin];
+                _b.n++; _b.sumRange += (h-l);
+                // Prevent unbounded growth — halve to preserve avg.
+                if(_b.n > 200){ _b.n = 100; _b.sumRange /= 2; }
+            }
+
             // ── DETERMINISTIC AVGVOL SEEDING ─────────────────────────
             // Same: only push on new bars. Tick updates evolve the live
             // bar's vol but don't add a new entry to the rolling buffer.
@@ -663,6 +683,7 @@ class MarketReader {
                 this.results=[];
                 this.pauseUntilBar=-1;
                 this.lastLossBar=-9999; this.lastLossDir=0; this.lastLossLevel='';
+                this.maxTradesOverrideUsed = false;
                 // Reset cooldown so the open can fire immediately if
                 // a setup presents. barsSinceSig was probably mid-cooldown
                 // at session change — don't carry that into the new session.
@@ -2339,7 +2360,12 @@ class MarketReader {
             else if(this.sessPnl*cv<=-maxLoss)         blockReason='MAX-LOSS';
             else if(!(atLevel||isSweepEntry))          blockReason='NO-LEVEL';
             this.blockReason = blockReason;
-            const canTrade = blockReason === '';
+            // Allow decision eval to proceed when the only block is MAX-TRADES
+            // and the regime-flip override hasn't been used yet — the actual
+            // override decision (opposite dir + score≥7) is applied after the
+            // decision is computed and the proposed direction is known.
+            const onlyMaxTrades = (blockReason === 'MAX-TRADES') && !this.maxTradesOverrideUsed;
+            const canTrade = blockReason === '' || onlyMaxTrades;
 
             // ── DIAGNOSTICS: log this bar's signal-attempt outcome ──
             // Every bar where we actively considered a trade (i.e., not
@@ -2482,6 +2508,24 @@ class MarketReader {
                        (bi - this.lastLossBar) < REPEAT_LOSS_BARS){
                         decision.fire = false;
                         this.blockReason = 'REPEAT-LOSS';
+                    }
+                    // Regime-flip override: when at MAX-TRADES, allow ONE extra
+                    // trade if it's the opposite direction of recent losses and
+                    // high-conviction. The market just flipped on us — taking
+                    // the new direction is the whole point. Bounded to one use
+                    // per session.
+                    if(decision.fire && this.dailyTrades >= maxTrades){
+                        const isFlip = this.lastLossDir !== 0 &&
+                                       dir === -this.lastLossDir &&
+                                       decision.totalScore >= 7 &&
+                                       !this.maxTradesOverrideUsed;
+                        if(isFlip){
+                            this.maxTradesOverrideUsed = true;
+                            this.blockReason = '';
+                        } else {
+                            decision.fire = false;
+                            this.blockReason = 'MAX-TRADES';
+                        }
                     }
                 }
                 if(decision.fire){
@@ -2923,6 +2967,34 @@ class MarketReader {
                         point:{x:_px, y:du(c+atr*1.5)},
                         style:{fontSize:_fz(11), fontWeight:'bold', fill:statusCol},
                         textAlignment:'leftMiddle', global:true});
+
+                    // ── HOT WINDOWS (volatility-by-hour) ─────────────
+                    // Pick the top-2 15-min bins by avg range (need ≥5
+                    // samples to be meaningful). Highlights when in or
+                    // approaching a hot window.
+                    const _binKeys = Object.keys(this.volBins);
+                    if(_binKeys.length > 0){
+                        const _ranked = _binKeys
+                            .map(k => ({k, n:this.volBins[k].n,
+                                        avg:this.volBins[k].sumRange/this.volBins[k].n}))
+                            .filter(b => b.n >= 5)
+                            .sort((a,b) => b.avg - a.avg)
+                            .slice(0,2);
+                        if(_ranked.length > 0){
+                            const _curBm = Math.floor(bLtm/15)*15;
+                            const _curBin = (bLth<10?'0':'')+bLth+':'+(_curBm<10?'0':'')+_curBm;
+                            const _inHot = _ranked.some(r => r.k === _curBin);
+                            const _hotText = 'HOT: ' + _ranked.map(r =>
+                                r.k+' ('+r.avg.toFixed(1)+')').join('  ') +
+                                (_inHot ? '  ← NOW' : '');
+                            _items.push({tag:'Text', key:'sm_hot_windows',
+                                text: _hotText,
+                                point:{x:_px, y:du(c+atr*1.2)},
+                                style:{fontSize:_fz(10), fontWeight:'bold',
+                                       fill:_inHot?'#FFCC44':'#88AABB'},
+                                textAlignment:'leftMiddle', global:true});
+                        }
+                    }
 
                     // ── PATTERN DETECTOR DIAGNOSTIC LINE ──
                     // Shows live state of detectors so we can see what

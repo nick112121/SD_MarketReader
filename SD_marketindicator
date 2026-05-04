@@ -2604,6 +2604,36 @@ class MarketReader {
                             this.blockReason = 'H1-COUNTER';
                         }
                     }
+                    // MOMENTUM filter: catches what COUNTER-DAY misses early.
+                    // A 6+ ATR drop over 30 bars before the day's "directional"
+                    // threshold trips would still let a counter-trend long
+                    // slip through. This filter looks at the last 20 bars and
+                    // requires BOTH magnitude (net move > 3.5 ATR) AND
+                    // consistency (12+ of 20 bars closed in the move's
+                    // direction). Then refuses any trade against that flow.
+                    if(decision.fire && n >= 21){
+                        const _refClose = this.C[n - 21];
+                        const _netMv = c - _refClose;
+                        let _aligned = 0;
+                        for(let _i = 1; _i <= 20; _i++){
+                            const _o_i = this.O[n - 1 - _i];
+                            const _c_i = this.C[n - 1 - _i];
+                            if(_o_i == null || _c_i == null) continue;
+                            if(_netMv > 0 && _c_i > _o_i) _aligned++;
+                            else if(_netMv < 0 && _c_i < _o_i) _aligned++;
+                        }
+                        const _strong = Math.abs(_netMv) > atr * 3.5;
+                        const _consistent = _aligned >= 12;
+                        if(_strong && _consistent){
+                            const _momDir = _netMv > 0 ? 1 : -1;
+                            if(dir === -_momDir){
+                                decision.fire = false;
+                                this.blockReason = _momDir === -1
+                                    ? 'MOMENTUM-DOWN'
+                                    : 'MOMENTUM-UP';
+                            }
+                        }
+                    }
                     // Day-context filters: the 15-bar chase filter only sees
                     // recent action. A balance-then-dump day (today: 27945
                     // top → 27620 = 320pt one-sided) leaves a small recent

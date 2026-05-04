@@ -307,6 +307,63 @@ function testDistributionDay() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Test 14: MOMENTUM filter math — strong + consistent net move blocks
+// trades against the flow.
+// ─────────────────────────────────────────────────────────────────────────
+function testMomentumFilterMath() {
+    function shouldBlock(C, O, c, dir, atr) {
+        const n = C.length + 1;  // emulate indicator's n (length after current bar)
+        if (n < 21) return null;
+        const refClose = C[n - 21];
+        const netMv = c - refClose;
+        let aligned = 0;
+        for (let i = 1; i <= 20; i++) {
+            const o_i = O[n - 1 - i];
+            const c_i = C[n - 1 - i];
+            if (o_i == null || c_i == null) continue;
+            if (netMv > 0 && c_i > o_i) aligned++;
+            else if (netMv < 0 && c_i < o_i) aligned++;
+        }
+        const strong = Math.abs(netMv) > atr * 3.5;
+        const consistent = aligned >= 12;
+        if (!strong || !consistent) return null;
+        const momDir = netMv > 0 ? 1 : -1;
+        if (dir === -momDir) return momDir === -1 ? 'MOMENTUM-DOWN' : 'MOMENTUM-UP';
+        return null;
+    }
+    // Build a clean 20-bar bearish drift: each bar closes -3 from prior open
+    const C = [], O = [];
+    for (let i = 0; i < 22; i++) {
+        const o = 27940 - i * 3;
+        const c = o - 3;  // bearish
+        O.push(o); C.push(c);
+    }
+    const cur = 27860; // current price ≈ 80pt below start (matches today's scenario)
+    const atr = 13;
+    eq(shouldBlock(C, O, cur, 1, atr),  'MOMENTUM-DOWN', 'block LONG into bearish momentum');
+    eq(shouldBlock(C, O, cur, -1, atr), null,            'allow SHORT with bearish momentum');
+
+    // Insufficient consistency — half up half down bars but big net move
+    const C2 = [], O2 = [];
+    for (let i = 0; i < 22; i++) {
+        // Alternating colors but stair-stepping down in close
+        const o = 27940 - i * 3;
+        const c = o + (i % 2 === 0 ? 1 : -7);  // mixed colors
+        O2.push(o); C2.push(c);
+    }
+    eq(shouldBlock(C2, O2, 27870, 1, atr), null, 'allow when not consistent (only ~10 aligned)');
+
+    // Insufficient magnitude — small move
+    const C3 = [], O3 = [];
+    for (let i = 0; i < 22; i++) {
+        const o = 27940 - i * 0.3;  // tiny drift
+        const c = o - 0.3;
+        O3.push(o); C3.push(c);
+    }
+    eq(shouldBlock(C3, O3, 27933, 1, atr), null, 'allow when net move below threshold');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Run all
 // ─────────────────────────────────────────────────────────────────────────
 const tests = [
@@ -323,6 +380,7 @@ const tests = [
     ['H1-COUNTER math',              testH1CounterMath],
     ['LOSS-PAUSE threshold',         testLossPauseThreshold],
     ['distribution day end-to-end',  testDistributionDay],
+    ['MOMENTUM filter math',         testMomentumFilterMath],
 ];
 
 console.log('Running ' + tests.length + ' test groups…\n');

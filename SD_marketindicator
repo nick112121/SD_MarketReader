@@ -1733,7 +1733,7 @@ class MarketReader {
             // Only run on the live forward timeline — not on replay
             // passes. Otherwise SL/TP would falsely trigger when an old
             // bar is replayed that happens to touch our stop level.
-            let exitNow=false, exitPnl=0;
+            let exitNow=false, exitPnl=0, exitDir=0;
 
             // ════════════════════════════════════════════════════
             // RUN PATTERN HELPERS BEFORE POSITION MANAGEMENT
@@ -1934,6 +1934,7 @@ class MarketReader {
 
                 if(hitTP2||hitSL||hitTrail||maxHit||eodExit||peakGiveBackExit||thesisBrokenExit||wyckoffEventExit){
                     exitNow=true;
+                    exitDir=pos;
                     exitPnl = pos===1 ? c-this.ep : this.ep-c;
 
                     const win = exitPnl >= 0;
@@ -2766,9 +2767,12 @@ class MarketReader {
                 // Tradovate dedups by key, so a stable key per trade
                 // produces a single label even if map() re-fires.
                 const _exKey = 'ex_'+(this.entryBar||0)+'_'+bi;
+                // Place above bar when LONG-win or SHORT-loss (price went up at exit),
+                // below bar when LONG-loss or SHORT-win (price went down at exit).
+                const _above = (exitDir===1) === win;
                 _items.push({tag:'Text',key:_exKey,
                     text:win?'✓ WIN':'✗ LOSS',
-                    point:{x:du(this.lastChartIdx),y:du(win?h+atr:l-atr)},
+                    point:{x:du(this.lastChartIdx),y:du(_above?h+atr:l-atr)},
                     style:{fontSize:_fz(11),fontWeight:'bold',fill:win?_C.winText:_C.lossText},
                     textAlignment:'centerMiddle'});
             }

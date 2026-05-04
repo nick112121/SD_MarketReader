@@ -3227,87 +3227,56 @@ class MarketReader {
                                     sessSuffix==='_asia'    ? 'ASIA'  :
                                     sessSuffix==='_london'  ? 'LON'   :
                                                               'OFF';
-                    let statusText, statusCol;
+                    // ── SINGLE CONSOLIDATED HUD LINE ──────────────────
+                    // Everything you need in one row, anchored ABOVE the
+                    // session high so it never sits on candles. Indicator
+                    // does the heavy lifting; the chart stays clean.
+                    //
+                    // Format:
+                    //   [NY] WATCH 2/3 • Q5 RANGE • DAY ▼-78 P23% IB↓ H1▼ • 2F 0W2L
+                    let _stateTag, _stateCol;
                     if(this.position!==0){
-                        statusText = '['+sessTag+'] IN TRADE  '+this.dailyTrades+'/'+maxTrades;
-                        statusCol = this.position===1?'#00FFCC':'#FF6622';
+                        _stateTag = 'IN-TRADE';
+                        _stateCol = this.position===1?'#00FFCC':'#FF6622';
                     } else if(this.blockReason){
-                        statusText = '['+sessTag+'] BLOCKED: '+this.blockReason+'  '+this.dailyTrades+'/'+maxTrades;
-                        statusCol = '#888888';
+                        _stateTag = this.blockReason;
+                        _stateCol = '#888888';
                     } else {
-                        statusText = '['+sessTag+'] WATCHING  '+this.dailyTrades+'/'+maxTrades;
-                        statusCol = '#AAAAAA';
+                        _stateTag = 'WATCH';
+                        _stateCol = '#AAAAAA';
                     }
-                    _items.push({tag:'Text', key:'sm_status',
-                        text: statusText,
-                        point:{x:_px, y:du(c+atr*1.5)},
-                        style:{fontSize:_fz(11), fontWeight:'bold', fill:statusCol},
-                        textAlignment:'leftMiddle', global:true});
-
-                    // ── DAY CONTEXT (what the day looks like right now) ──
-                    // Shows session O/H/L, current move from open, IB
-                    // status, H1 trend, and cumulative delta so you can
-                    // see exactly what the regime filters are reading.
+                    const _hudParts = ['['+sessTag+'] '+_stateTag+' '+
+                                       this.dailyTrades+'/'+maxTrades];
+                    const _qNum = (this.dayQuality != null) ? this.dayQuality : 5;
+                    const _msShort = this.marketState && this.marketState !== 'NEUTRAL'
+                        ? ' '+this.marketState : '';
+                    _hudParts.push('Q'+_qNum.toFixed(0)+_msShort);
                     if(this.sessOpen > 0){
-                        const _dRng = Math.max(this.sessHigh - this.sessLow, 0.01);
-                        const _dMv  = c - this.sessOpen;
-                        const _PIDR = (c - this.sessLow) / _dRng;
-                        const _dDir = _dMv > 0 ? '▲' : _dMv < 0 ? '▼' : '·';
-                        const _dCol = Math.abs(_dMv) > atr * 4
-                            ? (_dMv > 0 ? '#00DC78' : '#E24B4A')
-                            : '#88AABB';
-                        const _ibTag = this.ibBroken === 1  ? '  IB↑BROKEN' :
-                                       this.ibBroken === -1 ? '  IB↓BROKEN' :
-                                       this.ibLocked        ? '  IB·HELD'   : '';
-                        const _h1Tag = this.h1Trend === 'BULL' ? '  H1▲' :
-                                       this.h1Trend === 'BEAR' ? '  H1▼' : '';
-                        const _cd    = this.cumDelta || 0;
-                        const _cdTag = Math.abs(_cd) >= 100
-                            ? '  CD '+(_cd>0?'+':'')+_cd.toFixed(0)
+                        const _dRng2 = Math.max(this.sessHigh - this.sessLow, 0.01);
+                        const _dMv2  = c - this.sessOpen;
+                        const _PIDR2 = (c - this.sessLow) / _dRng2;
+                        const _ibSym = this.ibBroken === 1 ? ' IB↑' :
+                                       this.ibBroken === -1 ? ' IB↓' :
+                                       this.ibLocked ? ' IB·' : '';
+                        const _h1Sym = this.h1Trend === 'BULL' ? ' H1▲' :
+                                       this.h1Trend === 'BEAR' ? ' H1▼' : '';
+                        _hudParts.push('DAY '+(_dMv2>0?'▲':_dMv2<0?'▼':'·')+
+                                       (_dMv2>=0?'+':'')+_dMv2.toFixed(0)+
+                                       ' P'+(_PIDR2*100).toFixed(0)+_ibSym+_h1Sym);
+                    }
+                    if(this.firedCount > 0 || this.blockedCount > 0){
+                        const _wl = (this.sessionWins+this.sessionLosses) > 0
+                            ? ' '+this.sessionWins+'W'+this.sessionLosses+'L'
                             : '';
-                        const _dq    = (this.dayQuality != null) ? this.dayQuality : 5;
-                        const _dqTag = '  Q'+_dq.toFixed(0)+'/10';
-                        const _stTag = this.marketState && this.marketState !== 'NEUTRAL'
-                            ? '  ['+this.marketState+']' : '';
-                        const _dayText = 'DAY '+_dDir+' '+
-                            (_dMv>=0?'+':'')+_dMv.toFixed(1)+
-                            '  rng '+_dRng.toFixed(0)+
-                            '  PIDR '+(_PIDR*100).toFixed(0)+'%'+
-                            _ibTag + _h1Tag + _cdTag + _dqTag + _stTag;
-                        _items.push({tag:'Text', key:'sm_day_ctx',
-                            text: _dayText,
-                            point:{x:_px, y:du(c+atr*0.9)},
-                            style:{fontSize:_fz(10), fontWeight:'bold', fill:_dCol},
-                            textAlignment:'leftMiddle', global:true});
+                        _hudParts.push(this.firedCount+'F'+_wl);
                     }
-
-                    // ── HOT WINDOWS (volatility-by-hour) ─────────────
-                    // Pick the top-2 15-min bins by avg range (need ≥5
-                    // samples to be meaningful). Highlights when in or
-                    // approaching a hot window.
-                    const _binKeys = Object.keys(this.volBins);
-                    if(_binKeys.length > 0){
-                        const _ranked = _binKeys
-                            .map(k => ({k, n:this.volBins[k].n,
-                                        avg:this.volBins[k].sumRange/this.volBins[k].n}))
-                            .filter(b => b.n >= 5)
-                            .sort((a,b) => b.avg - a.avg)
-                            .slice(0,2);
-                        if(_ranked.length > 0){
-                            const _curBm = Math.floor(bLtm/15)*15;
-                            const _curBin = (bLth<10?'0':'')+bLth+':'+(_curBm<10?'0':'')+_curBm;
-                            const _inHot = _ranked.some(r => r.k === _curBin);
-                            const _hotText = 'HOT: ' + _ranked.map(r =>
-                                r.k+' ('+r.avg.toFixed(1)+')').join('  ') +
-                                (_inHot ? '  ← NOW' : '');
-                            _items.push({tag:'Text', key:'sm_hot_windows',
-                                text: _hotText,
-                                point:{x:_px, y:du(c+atr*1.2)},
-                                style:{fontSize:_fz(10), fontWeight:'bold',
-                                       fill:_inHot?'#FFCC44':'#88AABB'},
-                                textAlignment:'leftMiddle', global:true});
-                        }
-                    }
+                    // Anchor above session high so HUD doesn't touch candles.
+                    const _hudY = (this.sessHigh > 0 ? this.sessHigh : c) + atr * 2;
+                    _items.push({tag:'Text', key:'sm_hud',
+                        text: _hudParts.join('  •  '),
+                        point:{x:_px, y:du(_hudY)},
+                        style:{fontSize:_fz(11), fontWeight:'bold', fill:_stateCol},
+                        textAlignment:'leftMiddle', global:true});
 
                     // ── PATTERN DETECTOR DIAGNOSTIC LINE ──
                     // Shows live state of detectors so we can see what
@@ -3396,11 +3365,9 @@ class MarketReader {
                                          '×'+topVote.evidence.length+'/'+topVote.strength);
                         }
                     }
-                    _items.push({tag:'Text', key:'sm_pattern_diag',
-                        text: pdParts.join('  '),
-                        point:{x:_px, y:du(c+atr*1.05)},
-                        style:{fontSize:_fz(10), fontWeight:'normal', fill:_C.diagBlue},
-                        textAlignment:'leftMiddle', global:true});
+                    // Pattern detector diagnostic suppressed in simpleMode
+                    // (user wants a clean chart). Available in full mode.
+                    // _items.push({tag:'Text', key:'sm_pattern_diag', ...})
 
                     // ── DIAGNOSTICS OVERLAY (when diagMode is on) ──
                     // Health badge + recent auto-tune action + missed-setup
@@ -3461,14 +3428,10 @@ class MarketReader {
                     const wlStr = (this.sessionWins + this.sessionLosses) > 0
                         ? ' ('+this.sessionWins+'W/'+this.sessionLosses+'L)'
                         : '';
-                    const jrnText = '📓 '+this.firedCount+' fired'+wlStr+
-                                    ' | '+this.blockedCount+' blocked'+
-                                    ' | '+this.missedCount+' missed';
-                    _items.push({tag:'Text', key:'sm_jrn_summary',
-                        text: jrnText,
-                        point:{x:_px, y:du(c+atr*0.7)},
-                        style:{fontSize:_fz(10), fontWeight:'normal', fill:_C.diagGray},
-                        textAlignment:'leftMiddle', global:true});
+                    // Session counts now folded into the consolidated HUD line
+                    // above. The standalone journal-summary push is suppressed
+                    // in simpleMode for a cleaner chart.
+                    void wlStr;
 
                     // ── JOURNAL: full report (only when showReport=1) ──
                     // Fills the chart with a structured session report:

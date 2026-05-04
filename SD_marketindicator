@@ -1587,7 +1587,7 @@ class MarketReader {
             // bigger, 2.0 = double). Lets user dial the entire HUD up/down.
             // brightMode: 0 = standard colors, 1 = brightened for dark bg.
             // Both tunable via param panel.
-            const hudScale = (p.hudScale != null) ? Math.max(0.5, Math.min(3, p.hudScale)) : 1.3;
+            const hudScale = (p.hudScale != null) ? Math.max(0.5, Math.min(3, p.hudScale)) : 1.0;
             const brightMode = (p.brightMode != null) ? p.brightMode : 1;
             const _fz = (n) => Math.round(n * hudScale);  // size helper
             // Bright color palette for dark backgrounds (more readable)
@@ -6246,7 +6246,7 @@ module.exports = {
         // hudScale: multiplier for ALL text on the chart. 1.0 = default,
         //   1.3 = 30% bigger, 1.5 = 50% bigger, 2.0 = double. For dark
         //   backgrounds and small monitors, try 1.3-1.5. Range 0.5-3.0.
-        hudScale:          predef.paramSpecs.number(1.3, 0.1, 0.5),
+        hudScale:          predef.paramSpecs.number(1.0, 0.1, 0.5),
         // brightMode: 1 = brighter colors optimized for black/dark
         //   backgrounds (cyan/magenta/lime instead of muted variants).
         //   0 = standard. Default 1 since most users have dark theme.

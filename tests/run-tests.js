@@ -431,8 +431,78 @@ function testDayQualityBlock() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Run all
+// Test 18: State classifier — verify states emerge on synthetic arcs
 // ─────────────────────────────────────────────────────────────────────────
+function testStateClassifier() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+    // Seed C/H/L/O for a 30-bar bullish trend
+    for (let i = 0; i < 30; i++) {
+        const px = 27800 + i * 4;
+        mr.O.push(px - 1); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    mr.cumDelta = 800;
+    eq(mr._classifyMarketState(27920, 12), 'TREND_UP', 'bullish arc → TREND_UP');
+
+    // Reset for bearish trend
+    mr.O.length = 0; mr.H.length = 0; mr.L.length = 0; mr.C.length = 0;
+    for (let i = 0; i < 30; i++) {
+        const px = 27900 - i * 4;
+        mr.O.push(px + 1); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    mr.cumDelta = -800;
+    eq(mr._classifyMarketState(27780, 12), 'TREND_DOWN', 'bearish arc → TREND_DOWN');
+
+    // Tight range, positive CD → ACCUMULATION
+    mr.O.length = 0; mr.H.length = 0; mr.L.length = 0; mr.C.length = 0;
+    for (let i = 0; i < 30; i++) {
+        const px = 27800 + ((i % 4) - 1.5) * 2;
+        mr.O.push(px); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    mr.cumDelta = 600;
+    eq(mr._classifyMarketState(27800, 12), 'ACCUMULATION', 'tight range + CD+ → ACCUMULATION');
+
+    // Tight range, negative CD → DISTRIBUTION
+    mr.cumDelta = -600;
+    eq(mr._classifyMarketState(27800, 12), 'DISTRIBUTION', 'tight range + CD- → DISTRIBUTION');
+
+    // Insufficient data
+    mr.O.length = 0; mr.H.length = 0; mr.L.length = 0; mr.C.length = 0;
+    for (let i = 0; i < 5; i++) {
+        mr.O.push(27800); mr.H.push(27802); mr.L.push(27798); mr.C.push(27800);
+    }
+    eq(mr._classifyMarketState(27800, 12), 'NEUTRAL', '< 20 bars → NEUTRAL');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 19: State-setup WR lookup
+// ─────────────────────────────────────────────────────────────────────────
+function testStateSetupWR() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+
+    // Empty stats → null
+    eq(mr._stateSetupWR('TREND_DOWN', 'MTT_H'), null, 'empty stats → null');
+
+    // Insufficient samples (4) → null
+    mr.stateStats['TREND_DOWN'] = { 'MTT_H': { w: 0, l: 4, pnl: -10 } };
+    eq(mr._stateSetupWR('TREND_DOWN', 'MTT_H'), null, '4 samples → null');
+
+    // 5 losses, 0 wins → wr 0
+    mr.stateStats['TREND_DOWN']['MTT_H'].l = 5;
+    const wr = mr._stateSetupWR('TREND_DOWN', 'MTT_H');
+    truthy(wr, 'returns object');
+    if (wr) {
+        eq(wr.wr, 0, 'wr = 0 for 0W/5L');
+        eq(wr.n, 5, 'n = 5');
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// Run all
+// ─────────────────────────────────────────────────────────
 const tests = [
     ['load',                         testLoad],
     ['init defaults',                testInitDefaults],
@@ -451,6 +521,8 @@ const tests = [
     ['DAY-QUALITY composite',        testDayQualityComposite],
     ['HARD-STOP threshold',          testHardStop],
     ['DAY-QUALITY block threshold',  testDayQualityBlock],
+    ['state classifier',             testStateClassifier],
+    ['state-setup WR lookup',        testStateSetupWR],
 ];
 
 console.log('Running ' + tests.length + ' test groups…\n');

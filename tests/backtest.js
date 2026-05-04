@@ -74,11 +74,14 @@ function runDay(name, arc, count) {
 
     const blockHist = {};
     const dqHist = [];
+    const stateHist = {};
     for (let i = 0; i < bars.length; i++) {
         mr.map(makeData(bars[i]));
         const br = mr.blockReason || 'CAN-FIRE';
         blockHist[br] = (blockHist[br] || 0) + 1;
         if (mr.dayQuality != null) dqHist.push(mr.dayQuality);
+        const st = mr.marketState || 'NEUTRAL';
+        stateHist[st] = (stateHist[st] || 0) + 1;
     }
 
     const lastC = mr.C[mr.C.length - 1];
@@ -98,6 +101,8 @@ function runDay(name, arc, count) {
         finalDQ,
         avgDQ,
         blockHist,
+        finalState: mr.marketState,
+        stateHist,
     };
 }
 
@@ -108,8 +113,8 @@ console.log('═'.repeat(80));
 const results = dayTypes.map(d => runDay(d.name, d.arc, d.count));
 
 console.log(pad('REGIME', 14) + pad('IB', 14) + pad('dayMv', 10) +
-            pad('avgDQ', 8) + pad('finalDQ', 10) + 'top-block-reasons');
-console.log('─'.repeat(80));
+            pad('avgDQ', 8) + pad('Q', 4) + pad('STATE', 14) + 'top-block-reasons');
+console.log('─'.repeat(95));
 for (const r of results) {
     const ib = r.ibBroken === 1 ? 'IB↑broken' :
                r.ibBroken === -1 ? 'IB↓broken' :
@@ -124,7 +129,8 @@ for (const r of results) {
         pad(ib, 14) +
         pad(r.dayMv.toFixed(0), 10) +
         pad(r.avgDQ.toFixed(1), 8) +
-        pad(r.finalDQ.toFixed(0), 10) +
+        pad(r.finalDQ.toFixed(0), 4) +
+        pad(r.finalState, 14) +
         topReasons
     );
 }
@@ -158,6 +164,13 @@ check(byName['TREND-UP'].dayMv > 100,
     `TREND-UP dayMv > 100 (got ${byName['TREND-UP'].dayMv.toFixed(0)})`);
 check(byName['CHOP'].finalDQ >= 4,
     `CHOP finalDQ >= 4 (got ${byName['CHOP'].finalDQ})`);
+// State visits — classifier should have seen the right regime at some point
+check(byName['TREND-UP'].stateHist['TREND_UP'] >= 30,
+    `TREND-UP visited TREND_UP state (got ${byName['TREND-UP'].stateHist['TREND_UP']||0} bars)`);
+check(byName['DISTRIBUTION'].stateHist['TREND_DOWN'] >= 30,
+    `DISTRIBUTION visited TREND_DOWN state during the dump (got ${byName['DISTRIBUTION'].stateHist['TREND_DOWN']||0} bars)`);
+check((byName['BALANCE'].stateHist['RANGE'] || 0) >= 20,
+    `BALANCE visited RANGE state (got ${byName['BALANCE'].stateHist['RANGE']||0} bars)`);
 
 console.log(`\n  pass: ${pass}   fail: ${fail}`);
 if (fails.length) {

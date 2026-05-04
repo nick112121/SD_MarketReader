@@ -1982,7 +1982,11 @@ class MarketReader {
                     }
 
                     const losses = this.results.filter(r=>!r.win).length;
-                    if(losses>=3) this.pauseUntilBar = bi + PAUSE_BARS;
+                    // 2 losses in last 5 trades = pause. Was 3, but today's
+                    // session lost 4 in a row before pause kicked. When the
+                    // system is wrong about regime, give it a forced timeout
+                    // earlier so it can re-evaluate.
+                    if(losses>=2) this.pauseUntilBar = bi + PAUSE_BARS;
                     // Track the failing setup so we don't re-fire the same
                     // direction at the same level type immediately after.
                     if(!win){
@@ -2536,6 +2540,44 @@ class MarketReader {
                             }
                         }
                     }
+                    // Day-context filters: the 15-bar chase filter only sees
+                    // recent action. A balance-then-dump day (today: 27945
+                    // top → 27620 = 320pt one-sided) leaves a small recent
+                    // range at the bottom while the DAY has clearly trended.
+                    // Use sessOpen/sessHigh/sessLow to gauge the whole day.
+                    if(decision.fire && this.sessOpen > 0){
+                        const _dayRng = Math.max(this.sessHigh - this.sessLow, 0.01);
+                        const _dayMv  = c - this.sessOpen;
+                        const _PIDR   = (c - this.sessLow) / _dayRng; // 0=low, 1=high
+                        const _dayDir = _dayMv > 0 ? 1 : -1;
+                        const _directional = Math.abs(_dayMv) > atr * 4;
+                        if(_directional){
+                            // COUNTER-DAY: fading a directional day at the
+                            // wrong extreme = catching falling knife.
+                            //   LONG when day is down AND price near day low
+                            //   SHORT when day is up AND price near day high
+                            if(dir === 1 && _dayDir === -1 && _PIDR < 0.35){
+                                decision.fire = false;
+                                this.blockReason = 'COUNTER-DAY';
+                            } else if(dir === -1 && _dayDir === 1 && _PIDR > 0.65){
+                                decision.fire = false;
+                                this.blockReason = 'COUNTER-DAY';
+                            }
+                            // LATE-CHASE: piling in WITH a directional day at
+                            // its extreme — the move already paid out.
+                            //   SHORT into the lows of a down day
+                            //   LONG into the highs of an up day
+                            if(decision.fire){
+                                if(dir === -1 && _dayDir === -1 && _PIDR < 0.20){
+                                    decision.fire = false;
+                                    this.blockReason = 'LATE-CHASE';
+                                } else if(dir === 1 && _dayDir === 1 && _PIDR > 0.80){
+                                    decision.fire = false;
+                                    this.blockReason = 'LATE-CHASE';
+                                }
+                            }
+                        }
+                    }
                     // Regime-flip override: when at MAX-TRADES, allow ONE extra
                     // trade if it's the opposite direction of recent losses and
                     // high-conviction. The market just flipped on us — taking
@@ -2994,6 +3036,29 @@ class MarketReader {
                         point:{x:_px, y:du(c+atr*1.5)},
                         style:{fontSize:_fz(11), fontWeight:'bold', fill:statusCol},
                         textAlignment:'leftMiddle', global:true});
+
+                    // ── DAY CONTEXT (what the day looks like right now) ──
+                    // Shows session O/H/L, current move from open, and
+                    // position-in-day-range so you can see what the new
+                    // COUNTER-DAY / LATE-CHASE filters are reading.
+                    if(this.sessOpen > 0){
+                        const _dRng = Math.max(this.sessHigh - this.sessLow, 0.01);
+                        const _dMv  = c - this.sessOpen;
+                        const _PIDR = (c - this.sessLow) / _dRng;
+                        const _dDir = _dMv > 0 ? '▲' : _dMv < 0 ? '▼' : '·';
+                        const _dCol = Math.abs(_dMv) > atr * 4
+                            ? (_dMv > 0 ? '#00DC78' : '#E24B4A')
+                            : '#88AABB';
+                        const _dayText = 'DAY '+_dDir+' '+
+                            (_dMv>=0?'+':'')+_dMv.toFixed(1)+
+                            '  rng '+_dRng.toFixed(0)+
+                            '  PIDR '+(_PIDR*100).toFixed(0)+'%';
+                        _items.push({tag:'Text', key:'sm_day_ctx',
+                            text: _dayText,
+                            point:{x:_px, y:du(c+atr*0.9)},
+                            style:{fontSize:_fz(10), fontWeight:'bold', fill:_dCol},
+                            textAlignment:'leftMiddle', global:true});
+                    }
 
                     // ── HOT WINDOWS (volatility-by-hour) ─────────────
                     // Pick the top-2 15-min bins by avg range (need ≥5

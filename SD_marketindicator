@@ -5988,6 +5988,73 @@ class MarketReader {
         }
 
         lines.push('═══ SESSION REPORT ═══');
+        // ── WEEKLY / ALL-TIME PROFITABILITY (across the full journal) ──
+        // Aggregates EVERY recorded EXIT in memory, not just the active
+        // session. Gives the numbers needed to evaluate the indicator's
+        // expectancy + profit factor.
+        const _allExits = this.journal.filter(e => e.type === 'EXIT');
+        if(_allExits.length > 0){
+            let _wPnl = 0, _lPnl = 0, _w = 0, _l = 0, _maxL = 0, _maxW = 0;
+            const _bySess = {};
+            const _bySetup = {};
+            for(const e of _allExits){
+                const _pnl = typeof e.pnl === 'number' ? e.pnl : 0;
+                if(e.win){ _w++; _wPnl += _pnl; if(_pnl > _maxW) _maxW = _pnl; }
+                else      { _l++; _lPnl += _pnl; if(_pnl < _maxL) _maxL = _pnl; }
+                const _ses = e.session || 'UNKNOWN';
+                if(!_bySess[_ses]) _bySess[_ses] = {w:0,l:0,pnl:0};
+                _bySess[_ses][e.win?'w':'l']++;
+                _bySess[_ses].pnl += _pnl;
+            }
+            const _tot = _w + _l;
+            const _wr  = _tot>0 ? Math.round(_w/_tot*100) : 0;
+            const _avgW = _w>0 ? (_wPnl/_w) : 0;
+            const _avgL = _l>0 ? (_lPnl/_l) : 0;
+            const _grossW = _wPnl;
+            const _grossL = Math.abs(_lPnl);
+            const _pf = _grossL>0 ? (_grossW/_grossL).toFixed(2) : '∞';
+            const _expPt = _tot>0 ? ((_wPnl + _lPnl) / _tot) : 0;
+            const _net$ = Math.round((_wPnl + _lPnl) * (this.autoContractValue || 2));
+            lines.push('━━━ WEEKLY / ALL-TIME ━━━');
+            lines.push('Trades '+_tot+'  W '+_w+'/L '+_l+'  WR '+_wr+'%');
+            lines.push('Net '+(_net$>=0?'+$':'-$')+Math.abs(_net$)+
+                       '  ('+(_wPnl+_lPnl>=0?'+':'')+(_wPnl+_lPnl).toFixed(1)+'pt)');
+            lines.push('AvgW '+(_avgW>=0?'+':'')+_avgW.toFixed(1)+'pt'+
+                       '  AvgL '+_avgL.toFixed(1)+'pt'+
+                       '  Exp '+(_expPt>=0?'+':'')+_expPt.toFixed(2)+'pt/trade');
+            lines.push('PF '+_pf+
+                       '  MaxW '+_maxW.toFixed(1)+'pt'+
+                       '  MaxL '+_maxL.toFixed(1)+'pt');
+            // Per-day rollup
+            const _dayKeys = Object.keys(_bySess).sort();
+            if(_dayKeys.length > 0){
+                lines.push('Per session:');
+                for(const _sk of _dayKeys.slice(-7)){
+                    const _s = _bySess[_sk];
+                    const _spt = (_s.pnl).toFixed(1);
+                    lines.push('  '+_sk+'  '+_s.w+'W/'+_s.l+'L  '+
+                               (_s.pnl>=0?'+':'')+_spt+'pt');
+                }
+            }
+            // Per-state-per-setup table (online learning summary)
+            const _stKeys = Object.keys(this.stateStats || {});
+            if(_stKeys.length > 0){
+                lines.push('Per state × level type:');
+                for(const _st of _stKeys){
+                    const _setups = this.stateStats[_st];
+                    for(const _lt in _setups){
+                        const _ss = _setups[_lt];
+                        const _stTot = _ss.w + _ss.l;
+                        if(_stTot < 1) continue;
+                        const _stwr = Math.round(_ss.w/_stTot*100);
+                        lines.push('  '+_st+' × '+_lt+': '+
+                                   _ss.w+'W/'+_ss.l+'L ('+_stwr+'%)  '+
+                                   (_ss.pnl>=0?'+':'')+_ss.pnl.toFixed(1)+'pt');
+                    }
+                }
+            }
+            lines.push('───────────────────────');
+        }
         lines.push('Session: '+showSession+(isCurrent?' (live)':' (closed)'));
         lines.push('Fired: '+firedC+
                    '  Wins: '+winsC+

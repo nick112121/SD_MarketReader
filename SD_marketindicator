@@ -151,6 +151,9 @@ class MarketReader {
         this.weekHigh=0; this.weekLow=999999;
         this.prevWeekHigh=0; this.prevWeekLow=0;
         this.vwapN=0; this.vwapD=0; this.vwap=0;
+        // Safety-net date stamp for the daily NY 9:30 sigma refresh (set
+        // when sigma is recomputed; compared on each new bar).
+        this.sigmaRefreshDate = '';
         this.exp1H=0; this.exp1L=0;
         this.exp2H=0; this.exp2L=0;
         this.exp3H=0; this.exp3L=0;
@@ -822,6 +825,7 @@ class MarketReader {
                 this.volBuf=[];
                 this.avgVol=Math.max(vol, 1);
                 this._computeEXP(o);
+                this.sigmaRefreshDate = dateStr;
 
                 this.pullbackToSigma=false; this.pullbackLevel=0; this.pullbackLevelType='';
                 this.trendDay=false; this.trendDayDir=0;
@@ -839,6 +843,19 @@ class MarketReader {
             } else if(isNewBar) {
                 if(h>this.sessHigh) this.sessHigh=h;
                 if(l<this.sessLow)  this.sessLow=l;
+                // Safety net: refresh sigma at every NY 9:30 calendar-day
+                // open even if sessKey didn't transition. Catches the case
+                // where the wall-clock fallback masks session boundaries
+                // and sigma stays stuck on an old open from days ago.
+                const _isNYOpenBar = (bLth === 9 && bLtm >= 30 && bLtm < 35) ||
+                                     (bLth === 9 && bLtm === 30);
+                if(_isNYOpenBar && this.sigmaRefreshDate !== dateStr){
+                    this.sigmaRefreshDate = dateStr;
+                    this.sessOpen = o;
+                    this.sessHigh = h; this.sessLow = l;
+                    this.sessOpenBar = bi;
+                    this._computeEXP(o);
+                }
             }
 
             // ── INITIAL BALANCE (NY first 60 min) ────────────────────

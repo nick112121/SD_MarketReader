@@ -155,6 +155,11 @@ class MarketReader {
         // when sigma is recomputed; compared on each new bar).
         this.sigmaRefreshDate = '';
         this.exp1H=0; this.exp1L=0;
+        // Sigma-level respect tracking. For each level (1H/1L/2H/2L/3H/3L/4H/4L)
+        // count touches, reversals, and break-throughs to measure whether
+        // price actually respects the computed levels.
+        this.sigmaStats = {};
+        this.pendingSigma = {};   // { key: {hitBar, levelPrice, side, hitFromAbove} }
         this.exp2H=0; this.exp2L=0;
         this.exp3H=0; this.exp3L=0;
         this.exp4H=0; this.exp4L=0;
@@ -644,6 +649,8 @@ class MarketReader {
             // Used by the STATE-FAIL dynamic gate and surfaced in HUD.
             if(isNewBar){
                 this.marketState = this._classifyMarketState(c, atr);
+                // Track which sigma levels actually get respected vs broken.
+                this._trackSigmaRespect(bi, h, l, c, atr);
             }
 
             // ── VOLATILITY-BY-HOUR PROFILE ───────────────────────────
@@ -4026,6 +4033,55 @@ class MarketReader {
         }
     }
 
+    // Sigma-level respect tracker — call once per new bar with bi/h/l/c/atr.
+    // Each level (1H/1L/2H/2L/3H/3L/4H/4L) gets touches counted when price
+    // first reaches it, then 5 bars later we classify the outcome:
+    //   reversal — close still on the original side
+    //   break    — close beyond the level (clean breach)
+    _trackSigmaRespect(bi, h, l, c, atr){
+        const lvls = [
+            ['1H', this.exp1H], ['1L', this.exp1L],
+            ['2H', this.exp2H], ['2L', this.exp2L],
+            ['3H', this.exp3H], ['3L', this.exp3L],
+            ['4H', this.exp4H], ['4L', this.exp4L],
+        ];
+        const tol = Math.max(atr * 0.2, this.tickSize * 2);
+        const verifyBars = 5;
+
+        // First, classify any pending touches whose verification window passed
+        for (const k in this.pendingSigma) {
+            const p = this.pendingSigma[k];
+            if (bi - p.hitBar < verifyBars) continue;
+            if (!this.sigmaStats[k]) {
+                this.sigmaStats[k] = { touches:0, reversals:0, breaks:0 };
+            }
+            const s = this.sigmaStats[k];
+            // For an H-level (resistance) hit from below: reversal = close < level, break = close >= level
+            // For an L-level (support) hit from above:    reversal = close > level, break = close <= level
+            const isH = k.endsWith('H');
+            const broken = isH ? (c >= p.levelPrice) : (c <= p.levelPrice);
+            if (broken) s.breaks++; else s.reversals++;
+            delete this.pendingSigma[k];
+        }
+
+        // Then look for fresh touches this bar
+        for (const [k, lvl] of lvls) {
+            if (!lvl || lvl <= 0) continue;
+            if (this.pendingSigma[k]) continue;     // already pending
+            const isH = k.endsWith('H');
+            const touched = isH
+                ? (h >= lvl - tol && c < lvl)       // reached from below, not yet broken
+                : (l <= lvl + tol && c > lvl);      // reached from above, not yet broken
+            if (touched) {
+                if (!this.sigmaStats[k]) {
+                    this.sigmaStats[k] = { touches:0, reversals:0, breaks:0 };
+                }
+                this.sigmaStats[k].touches++;
+                this.pendingSigma[k] = { hitBar: bi, levelPrice: lvl };
+            }
+        }
+    }
+
     _computeEXP(open){
         const sk = this.sessKey;
         const floor = sk.includes('_ny')     ? 300 :
@@ -6173,6 +6229,20 @@ class MarketReader {
             lines.push('PF '+_pf+
                        '  MaxW '+_maxW.toFixed(1)+'pt'+
                        '  MaxL '+_maxL.toFixed(1)+'pt');
+            // Sigma respect — how often each level holds vs breaks.
+            const _sigKeys = Object.keys(this.sigmaStats || {});
+            if(_sigKeys.length > 0){
+                lines.push('Sigma respect:');
+                const _order = ['1H','1L','2H','2L','3H','3L','4H','4L'];
+                for(const _sk of _order){
+                    const _ss = this.sigmaStats[_sk];
+                    if(!_ss || _ss.touches < 1) continue;
+                    const _resolved = _ss.reversals + _ss.breaks;
+                    const _pct = _resolved>0 ? Math.round(_ss.reversals/_resolved*100) : 0;
+                    lines.push('  '+_sk+': '+_ss.touches+' touches, '+
+                               _ss.reversals+' reversals ('+_pct+'%)');
+                }
+            }
             // Bubble baseline for this chart — useful for tuning the
             // contra/hold floor params per chart (NY 4096t vs EVE 3072t).
             if(this.bubbleAvgAbs > 0){

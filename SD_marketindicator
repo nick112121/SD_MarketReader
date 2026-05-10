@@ -249,6 +249,12 @@ class MarketReader {
         // history so entry/exit logic can reference recent bubbles.
         // Bubble shape: { bar, price, delta, ts }
         this.bubbles = [];
+        // Running average of |bubble delta| — updated as new bubbles
+        // print, used to scale the contra/hold thresholds adaptively per
+        // chart. Different tick charts (e.g., NY 4096-tick vs EVE 3072-
+        // tick) have different baseline volume, so an absolute threshold
+        // is misleading. Using avg × multiplier auto-tunes to each chart.
+        this.bubbleAvgAbs = 0;
 
         // ── MARKET-STATE RECOGNITION ──────────────────────────
         // Each bar we classify the market into one of 6 regimes so
@@ -618,6 +624,13 @@ class MarketReader {
                                 ts: ts.getTime(),
                             });
                             if(this.bubbles.length > 40) this.bubbles.shift();
+                            // EMA of |delta| over recent bubbles. Used by the
+                            // contra/hold filters to auto-scale thresholds
+                            // to this chart's typical bubble magnitude.
+                            const _alpha = 0.1;
+                            this.bubbleAvgAbs = this.bubbleAvgAbs > 0
+                                ? this.bubbleAvgAbs * (1 - _alpha) + _maxAbs * _alpha
+                                : _maxAbs;
                         }
                     }
                 } catch(e) { /* profile unavailable on this chart — skip */ }
@@ -2063,12 +2076,18 @@ class MarketReader {
                     // Bubble-aware: a fresh bubble in trade direction means
                     // the move still has aggressive participation — give it
                     // more room to run. Bubble against = tighten and lock in.
+                    // Threshold = max(absFloor, avgBubble * 1.8) — auto-
+                    // scales per chart so NY (4096t) and EVE (3072t) both
+                    // get a meaningful "strong bubble" definition.
                     const _bubX = this._recentBubbleAtZone(c, atr, 3, 2.0, bi);
                     if(_bubX){
                         const _bubXDir = _bubX.delta > 0 ? 1 : -1;
-                        if(_bubXDir === pos && Math.abs(_bubX.delta) > 250){
+                        const _holdMult  = (p.bubbleHoldMult!=null?p.bubbleHoldMult:1.8);
+                        const _holdFloor = (p.bubbleHoldFloor!=null?p.bubbleHoldFloor:250);
+                        const _strongHold = Math.max(_holdFloor, this.bubbleAvgAbs * _holdMult);
+                        if(_bubXDir === pos && Math.abs(_bubX.delta) > _strongHold){
                             trailDist *= 1.5;  // hold the winner — flow agrees
-                        } else if(_bubXDir !== pos && Math.abs(_bubX.delta) > 250){
+                        } else if(_bubXDir !== pos && Math.abs(_bubX.delta) > _strongHold){
                             trailDist *= 0.6;  // flow flipped — tighten now
                         }
                     }
@@ -2776,12 +2795,16 @@ class MarketReader {
                     // direction delta bubble printed at this level in the
                     // last 5 bars. Means the wrong side is aggressively
                     // hitting it — your level isn't holding.
+                    // Threshold = max(absoluteFloor, avgBubble * 1.5) — auto-
+                    // scales to each chart's own bubble activity.
                     if(decision.fire){
                         const _bub = this._recentBubbleAtZone(c, atr, 5, 1.0, bi);
                         if(_bub){
                             const _bubDir = _bub.delta > 0 ? 1 : -1;
-                            // Entry direction OPPOSITE to bubble flow
-                            if(dir !== _bubDir && Math.abs(_bub.delta) > 200){
+                            const _contraMult = (p.bubbleContraMult!=null?p.bubbleContraMult:1.5);
+                            const _floor = (p.bubbleContraFloor!=null?p.bubbleContraFloor:200);
+                            const _strongTh = Math.max(_floor, this.bubbleAvgAbs * _contraMult);
+                            if(dir !== _bubDir && Math.abs(_bub.delta) > _strongTh){
                                 decision.fire = false;
                                 this.blockReason = 'BUBBLE-CONTRA';
                             }
@@ -6130,6 +6153,14 @@ class MarketReader {
             lines.push('PF '+_pf+
                        '  MaxW '+_maxW.toFixed(1)+'pt'+
                        '  MaxL '+_maxL.toFixed(1)+'pt');
+            // Bubble baseline for this chart — useful for tuning the
+            // contra/hold floor params per chart (NY 4096t vs EVE 3072t).
+            if(this.bubbleAvgAbs > 0){
+                lines.push('Bubble avg|Δ|: '+this.bubbleAvgAbs.toFixed(0)+
+                           '  contra≥'+Math.max(
+                               (this.props && this.props.bubbleContraFloor!=null?this.props.bubbleContraFloor:200),
+                               this.bubbleAvgAbs * 1.5).toFixed(0));
+            }
             // Per-day rollup
             const _dayKeys = Object.keys(_bySess).sort();
             if(_dayKeys.length > 0){
@@ -6622,8 +6653,19 @@ module.exports = {
         //   noisy contracts, lower for thin volume.
         // bubblePriceLevels: bucket size in ticks. 6 ticks/bucket on
         //   tick charts gives clean readings; larger on time charts.
+        // bubbleThreshold: minimum |delta| for a bucket to register as a
+        //   bubble at all. Floor for the rolling average. Tune per chart:
+        //   NY 4096-tick ≈ 120-200, EVE 3072-tick ≈ 60-120, ES/NQ full
+        //   contracts ≈ 250-400.
         bubbleThreshold:   predef.paramSpecs.number(120, 10, 0),
         bubblePriceLevels: predef.paramSpecs.number(6, 1, 1),
+        // Contra/hold thresholds are computed as max(floor, avgBubble × mult).
+        // Keeps the filter meaningful regardless of which tick chart is
+        // running — the ema of bubbleAvgAbs auto-tunes to each chart.
+        bubbleContraFloor: predef.paramSpecs.number(200, 25, 0),
+        bubbleContraMult:  predef.paramSpecs.number(1.5, 0.1, 0.5),
+        bubbleHoldFloor:   predef.paramSpecs.number(250, 25, 0),
+        bubbleHoldMult:    predef.paramSpecs.number(1.8, 0.1, 0.5),
     },
     plots: {},
     schemeStyles: { dark: {} },

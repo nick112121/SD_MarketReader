@@ -242,6 +242,14 @@ class MarketReader {
         this.pauseUntilBar=-1;
         this.totalW=0; this.totalL=0; this.totalPnl=0;
         // Per-behavior performance buckets — auto-disable losers
+        // ── DELTA BUBBLES ─────────────────────────────────────
+        // Per-bar largest bid-ask imbalance at a price level. Detected by
+        // bucketing the bar's volume profile into N-tick slots and finding
+        // the slot with the biggest |askVol - bidVol|. Stored as a rolling
+        // history so entry/exit logic can reference recent bubbles.
+        // Bubble shape: { bar, price, delta, ts }
+        this.bubbles = [];
+
         // ── MARKET-STATE RECOGNITION ──────────────────────────
         // Each bar we classify the market into one of 6 regimes so
         // downstream filters can adapt. Plus per-state setup stats
@@ -564,6 +572,56 @@ class MarketReader {
             }
             // (On tick updates, this.atr stays stable from previous bar close.)
             const atr = Math.max(this.atr, this.atrFloor);
+
+            // ── DELTA BUBBLE DETECTION (per new bar) ─────────────────
+            // For each new bar, look at its volume profile and find the
+            // price level with the biggest |askVol - bidVol|. If above the
+            // threshold, record it. The history feeds entry confirmation
+            // and exit-hold logic. Wrapped in try/catch — d.profile() may
+            // be unavailable on chart types without per-price volume.
+            if(isNewBar && typeof d.profile === 'function'){
+                try {
+                    const _profs = d.profile();
+                    if(_profs && _profs.length > 0){
+                        const _bThr = (p.bubbleThreshold!=null?p.bubbleThreshold:120);
+                        const _ppb  = (p.bubblePriceLevels!=null?p.bubblePriceLevels:6);
+                        const _step = this.tickSize * _ppb;
+                        const _buckets = {};
+                        let _last = null, _barInit = null;
+                        const _sorted = _profs.slice().sort((a,b)=>a.price-b.price);
+                        for(const pr of _sorted){
+                            if(_barInit === null) _barInit = pr.price;
+                            if(_last !== null && _last >= _barInit + _step) _barInit = pr.price;
+                            const k = _barInit.toFixed(7);
+                            if(!_buckets[k]){
+                                _buckets[k] = { price:_barInit, askVol:0, bidVol:0 };
+                            }
+                            _buckets[k].askVol += (pr.askVol || 0);
+                            _buckets[k].bidVol += (pr.bidVol || 0);
+                            _last = pr.price;
+                        }
+                        // Find the largest absolute delta bucket.
+                        let _maxAbs = 0, _bub = null;
+                        for(const k in _buckets){
+                            const _bk = _buckets[k];
+                            const _d = _bk.askVol - _bk.bidVol;
+                            if(Math.abs(_d) > _maxAbs){
+                                _maxAbs = Math.abs(_d);
+                                _bub = { price:_bk.price, delta:_d };
+                            }
+                        }
+                        if(_bub && _maxAbs >= _bThr){
+                            this.bubbles.push({
+                                bar: bi,
+                                price: _bub.price,
+                                delta: _bub.delta,
+                                ts: ts.getTime(),
+                            });
+                            if(this.bubbles.length > 40) this.bubbles.shift();
+                        }
+                    }
+                } catch(e) { /* profile unavailable on this chart — skip */ }
+            }
 
             // ── MARKET-STATE CLASSIFICATION (per new bar) ────────────
             // Recompute the regime once per bar; cache on `this.marketState`.
@@ -2002,6 +2060,18 @@ class MarketReader {
                         if(strengthScore >= 7)      trailDist = atr * 2.2;  // looser
                         else if(strengthScore <= 3) trailDist = atr * 0.9;  // tighter
                     }
+                    // Bubble-aware: a fresh bubble in trade direction means
+                    // the move still has aggressive participation — give it
+                    // more room to run. Bubble against = tighten and lock in.
+                    const _bubX = this._recentBubbleAtZone(c, atr, 3, 2.0, bi);
+                    if(_bubX){
+                        const _bubXDir = _bubX.delta > 0 ? 1 : -1;
+                        if(_bubXDir === pos && Math.abs(_bubX.delta) > 250){
+                            trailDist *= 1.5;  // hold the winner — flow agrees
+                        } else if(_bubXDir !== pos && Math.abs(_bubX.delta) > 250){
+                            trailDist *= 0.6;  // flow flipped — tighten now
+                        }
+                    }
                     if(pos===1)  this.trailSL = Math.max(this.trailSL, c-trailDist);
                     if(pos===-1) this.trailSL = Math.min(this.trailSL, c+trailDist);
                 }
@@ -2700,6 +2770,21 @@ class MarketReader {
                         if(dir === -_h1Dir && (decision.totalScore || 0) < 7){
                             decision.fire = false;
                             this.blockReason = 'H1-COUNTER';
+                        }
+                    }
+                    // BUBBLE-CONTRA: refuse entry when a strong OPPOSITE-
+                    // direction delta bubble printed at this level in the
+                    // last 5 bars. Means the wrong side is aggressively
+                    // hitting it — your level isn't holding.
+                    if(decision.fire){
+                        const _bub = this._recentBubbleAtZone(c, atr, 5, 1.0, bi);
+                        if(_bub){
+                            const _bubDir = _bub.delta > 0 ? 1 : -1;
+                            // Entry direction OPPOSITE to bubble flow
+                            if(dir !== _bubDir && Math.abs(_bub.delta) > 200){
+                                decision.fire = false;
+                                this.blockReason = 'BUBBLE-CONTRA';
+                            }
                         }
                     }
                     // STATE-FAIL: dynamic gate from per-state historical stats.
@@ -5898,6 +5983,26 @@ class MarketReader {
         return { wr: s.w / n, n };
     }
 
+    // Look for a recent bubble within `lookback` bars near `price` (within
+    // `priceTol` ATR). Returns the strongest match keyed by direction (positive
+    // delta = ask aggression = bullish; negative = bearish). null if none.
+    _recentBubbleAtZone(price, atr, lookback, priceTol, bi) {
+        if (!this.bubbles || this.bubbles.length === 0) return null;
+        const tol = atr * priceTol;
+        let best = null, bestAbs = 0;
+        for (let i = this.bubbles.length - 1; i >= 0; i--) {
+            const b = this.bubbles[i];
+            if ((bi - b.bar) > lookback) break;
+            if (Math.abs(b.price - price) <= tol) {
+                if (Math.abs(b.delta) > bestAbs) {
+                    bestAbs = Math.abs(b.delta);
+                    best = b;
+                }
+            }
+        }
+        return best;
+    }
+
     _findTPs(dir, price, levels, atr){
         const cands = levels
             .map(lv=>lv.price)
@@ -6407,6 +6512,11 @@ module.exports = {
     name:       'SD_MarketReader',
     calculator: MarketReader,
     inputType:  'bars',
+    // Enable per-bar volume-profile data (d.profile()) so the bubble
+    // detector can read price-level bid/ask volume.
+    requirements: {
+        volumeProfiles: true,
+    },
     plotter: [
         predef.plotters.custom(expPlotter)
     ],
@@ -6506,6 +6616,14 @@ module.exports = {
         //   backgrounds (cyan/magenta/lime instead of muted variants).
         //   0 = standard. Default 1 since most users have dark theme.
         brightMode:        predef.paramSpecs.number(1, 1, 0),
+        // ── DELTA BUBBLES (Sethmo-style) ──────────────────────────
+        // bubbleThreshold: minimum |askVol-bidVol| in a price bucket to
+        //   register as a bubble. 120 is reasonable for MNQ; raise for
+        //   noisy contracts, lower for thin volume.
+        // bubblePriceLevels: bucket size in ticks. 6 ticks/bucket on
+        //   tick charts gives clean readings; larger on time charts.
+        bubbleThreshold:   predef.paramSpecs.number(120, 10, 0),
+        bubblePriceLevels: predef.paramSpecs.number(6, 1, 1),
     },
     plots: {},
     schemeStyles: { dark: {} },

@@ -500,6 +500,48 @@ function testStateSetupWR() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Test 20: Bubble zone lookup
+// ─────────────────────────────────────────────────────────────────────────
+function testBubbleZoneLookup() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+
+    // Empty bubbles → null
+    eq(mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100), null, 'no bubbles → null');
+
+    // Bubble within zone, recent → returns it
+    mr.bubbles = [
+        { bar: 95, price: 27800, delta: -350, ts: 0 },
+    ];
+    const r1 = mr._recentBubbleAtZone(27805, 12, 5, 1.0, 100);
+    truthy(r1, 'bubble found within tol');
+    if (r1) eq(r1.delta, -350, 'returns the matching bubble');
+
+    // Bubble too old → null
+    mr.bubbles = [
+        { bar: 50, price: 27800, delta: -350, ts: 0 },
+    ];
+    eq(mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100), null, 'old bubble (>5 bars) → null');
+
+    // Bubble too far in price → null
+    mr.bubbles = [
+        { bar: 99, price: 27750, delta: -350, ts: 0 },
+    ];
+    eq(mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100), null, 'far bubble (>1 ATR) → null');
+
+    // Multiple bubbles — return strongest
+    mr.bubbles = [
+        { bar: 97, price: 27800, delta: 100, ts: 0 },
+        { bar: 99, price: 27802, delta: -400, ts: 0 },
+        { bar: 98, price: 27804, delta: 250, ts: 0 },
+    ];
+    const r2 = mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100);
+    truthy(r2, 'multi-bubble returns one');
+    if (r2) eq(r2.delta, -400, 'returns the strongest bubble');
+}
+
 // ─────────────────────────────────────────────────────────
 // Run all
 // ─────────────────────────────────────────────────────────
@@ -523,6 +565,7 @@ const tests = [
     ['DAY-QUALITY block threshold',  testDayQualityBlock],
     ['state classifier',             testStateClassifier],
     ['state-setup WR lookup',        testStateSetupWR],
+    ['bubble zone lookup',           testBubbleZoneLookup],
 ];
 
 console.log('Running ' + tests.length + ' test groups…\n');

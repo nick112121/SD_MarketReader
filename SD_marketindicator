@@ -825,7 +825,7 @@ class MarketReader {
                 this.volBuf=[];
                 this.avgVol=Math.max(vol, 1);
                 this._computeEXP(o);
-                this.sigmaRefreshDate = dateStr;
+                this.sigmaRefreshDate = newSessKey;
 
                 this.pullbackToSigma=false; this.pullbackLevel=0; this.pullbackLevelType='';
                 this.trendDay=false; this.trendDayDir=0;
@@ -843,14 +843,17 @@ class MarketReader {
             } else if(isNewBar) {
                 if(h>this.sessHigh) this.sessHigh=h;
                 if(l<this.sessLow)  this.sessLow=l;
-                // Safety net: refresh sigma at every NY 9:30 calendar-day
-                // open even if sessKey didn't transition. Catches the case
-                // where the wall-clock fallback masks session boundaries
-                // and sigma stays stuck on an old open from days ago.
-                const _isNYOpenBar = (bLth === 9 && bLtm >= 30 && bLtm < 35) ||
-                                     (bLth === 9 && bLtm === 30);
-                if(_isNYOpenBar && this.sigmaRefreshDate !== dateStr){
-                    this.sigmaRefreshDate = dateStr;
+                // Safety net: refresh sigma at every NY 9:30 AND EVE 18:00
+                // calendar-day open even if sessKey didn't transition.
+                // Catches the case where the wall-clock fallback masks
+                // session boundaries and sigma stays stuck on an old open.
+                const _isNYOpenBar  = (bLth === 9  && bLtm >= 30 && bLtm < 35);
+                const _isEVEOpenBar = (bLth === 18 && bLtm < 5);
+                const _refreshKey = _isNYOpenBar  ? dateStr+'_ny'
+                                  : _isEVEOpenBar ? dateStr+'_eve'
+                                  : '';
+                if(_refreshKey && this.sigmaRefreshDate !== _refreshKey){
+                    this.sigmaRefreshDate = _refreshKey;
                     this.sessOpen = o;
                     this.sessHigh = h; this.sessLow = l;
                     this.sessOpenBar = bi;

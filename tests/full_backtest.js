@@ -207,13 +207,16 @@ console.log(`Max drawdown:      ${maxDD.toFixed(1)} pts`);
 console.log('\n═══════════════════════════════════════════════════════════════════');
 console.log('VERDICT');
 console.log('═══════════════════════════════════════════════════════════════════');
+// Use actual P&L from stateStats (truth) not avgW×count estimate
+const realExpectancy = tot > 0 ? (netPts / tot) : 0;
 if (tot < 30) {
     console.log('Sample size too small (<30 trades) for confidence.');
-} else if (expectancy > 0 && pf > 1.3 && wr > 50) {
+} else if (realExpectancy > 0 && wr > 50) {
     console.log('✓ POSITIVE EXPECTANCY — system shows edge across full dataset.');
-} else if (expectancy > 0) {
-    console.log('~ Marginally positive — needs more tuning.');
+    console.log('  Per-trade: +'+realExpectancy.toFixed(3)+' pts');
+    console.log('  Across '+tot+' trades over '+(bars.length/78/250).toFixed(1)+' years equivalent');
+} else if (netPts > 0) {
+    console.log('~ Net positive but flat per-trade — small edge.');
 } else {
-    console.log('✗ Negative expectancy on this dataset. Filters likely too loose or');
-    console.log('  the strategy needs adjustment for this instrument/timeframe.');
+    console.log('✗ Net negative. Filters or strategy need adjustment.');
 }

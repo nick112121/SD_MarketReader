@@ -2878,13 +2878,17 @@ class MarketReader {
                         }
                     }
                     // STATE-FAIL: dynamic gate from per-state historical stats.
-                    // Look up THIS level-type's win-rate in the CURRENT
-                    // market state. If <40% over ≥5 samples, refuse.
-                    // Online learning lite — the indicator literally learns
-                    // which setups don't work in which regimes.
+                    // Refuses setups that have historically lost in the
+                    // current regime. Two block conditions:
+                    //   - <40% WR over ≥5 samples (clear coinflip-or-worse)
+                    //   - Negative cumulative P&L over ≥10 samples
+                    //     (wins are 50%+ but R:R is bad — backtest showed
+                    //     RANGE×MTT_L was 47% WR but -14.5pt total)
+                    // The PnL gate catches the trickier loser bucket the
+                    // WR gate misses.
                     if(decision.fire && _lt2pre){
                         const _wr = this._stateSetupWR(this.marketState, _lt2pre);
-                        if(_wr && _wr.wr < 0.40){
+                        if(_wr && (_wr.wr < 0.40 || (_wr.n >= 10 && _wr.pnl < 0))){
                             decision.fire = false;
                             this.blockReason = 'STATE-FAIL';
                         }
@@ -6114,14 +6118,15 @@ class MarketReader {
         return 'RANGE';
     }
 
-    // Return historical (state, setupTag) win-rate, or null if not enough samples.
+    // Return historical (state, setupTag) stats: win-rate, sample size, and
+    // total P&L. Null if fewer than 5 samples.
     _stateSetupWR(state, setupTag) {
         if (!this.stateStats[state]) return null;
         const s = this.stateStats[state][setupTag];
         if (!s) return null;
         const n = s.w + s.l;
         if (n < 5) return null;
-        return { wr: s.w / n, n };
+        return { wr: s.w / n, n, pnl: s.pnl };
     }
 
     // COIL detector — checks if the last N bars form a compression cluster.

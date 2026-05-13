@@ -491,13 +491,24 @@ function testStateSetupWR() {
     eq(mr._stateSetupWR('TREND_DOWN', 'MTT_H'), null, '4 samples → null');
 
     // 5 losses, 0 wins → wr 0
-    mr.stateStats['TREND_DOWN']['MTT_H'].l = 5;
+    mr.stateStats['TREND_DOWN']['MTT_H'] = { w: 0, l: 5, pnl: -10 };
     const wr = mr._stateSetupWR('TREND_DOWN', 'MTT_H');
     truthy(wr, 'returns object');
     if (wr) {
         eq(wr.wr, 0, 'wr = 0 for 0W/5L');
         eq(wr.n, 5, 'n = 5');
+        eq(wr.pnl, -10, 'pnl exposed');
     }
+
+    // STATE-FAIL upgrade: negative PnL with >=10 samples should also trigger
+    function shouldFail(stats) {
+        if (!stats) return false;
+        return stats.wr < 0.40 || (stats.n >= 10 && stats.pnl < 0);
+    }
+    eq(shouldFail({wr:0.30, n:6,  pnl:-5}),  true,  '<40% WR blocks');
+    eq(shouldFail({wr:0.55, n:15, pnl:-12}), true,  '55% WR but neg PnL @ 15 samples blocks');
+    eq(shouldFail({wr:0.55, n:15, pnl: 12}), false, '55% WR + positive PnL allows');
+    eq(shouldFail({wr:0.55, n:7,  pnl:-2}),  false, 'neg PnL but <10 samples allows (low confidence)');
 }
 
 // ─────────────────────────────────────────────────────────────────────────

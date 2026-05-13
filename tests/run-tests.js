@@ -542,6 +542,45 @@ function testBubbleZoneLookup() {
     if (r2) eq(r2.delta, -400, 'returns the strongest bubble');
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Test 21: COIL detector — compression detection + breakout direction
+// ─────────────────────────────────────────────────────────────────────────
+function testCoilDetector() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+
+    // Seed 8 tight bars (range ~0.4 ATR, closes within 0.5 ATR)
+    const center = 28000;
+    for (let i = 0; i < 8; i++) {
+        const px = center + (i % 3 - 1) * 1;  // closes oscillate by ±1
+        mr.O.push(px); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    const atr = 13;
+    const coil = mr._detectCoil(99, atr, 6);
+    truthy(coil, 'tight cluster detected as coil');
+    if (coil) truthy((coil.hi - coil.lo) < atr * 1.5, 'cluster range below 1.5 ATR');
+
+    // Reset; now seed 8 wide bars (range too big)
+    mr.O.length=0; mr.H.length=0; mr.L.length=0; mr.C.length=0;
+    for (let i = 0; i < 8; i++) {
+        const px = center + i * 5;
+        mr.O.push(px); mr.H.push(px + 15); mr.L.push(px - 15); mr.C.push(px);
+    }
+    eq(mr._detectCoil(99, atr, 6), null, 'wide bars NOT a coil');
+
+    // Coil + bull breakout bar
+    const coil2 = { hi: 28005, lo: 27995, avgRng: 5 };
+    eq(mr._coilBreakDir(coil2, 28030, 28005, 28032, 28000, atr), 1,
+        'strong-body bull bar above coil hi → +1');
+    // Coil + bear breakout bar
+    eq(mr._coilBreakDir(coil2, 27970, 27995, 28000, 27965, atr), -1,
+        'strong-body bear bar below coil lo → -1');
+    // Coil + small bar (not a breakout)
+    eq(mr._coilBreakDir(coil2, 28006, 28001, 28010, 27998, atr), 0,
+        'small-bodied bar → no break');
+}
+
 // ─────────────────────────────────────────────────────────
 // Run all
 // ─────────────────────────────────────────────────────────
@@ -566,6 +605,7 @@ const tests = [
     ['state classifier',             testStateClassifier],
     ['state-setup WR lookup',        testStateSetupWR],
     ['bubble zone lookup',           testBubbleZoneLookup],
+    ['coil detector',                testCoilDetector],
 ];
 
 console.log('Running ' + tests.length + ' test groups…\n');

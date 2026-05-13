@@ -2137,6 +2137,41 @@ class MarketReader {
                     if(pos===-1 && c<=this.tp1){ this.tp1Hit=true; this.trailSL=c+atr*1.5; }
                 }
 
+                // ── TP-VS-SL PROXIMITY + STALL DETECTION ─────────────
+                // Before TP1 hits, assess whether TP is more reachable than
+                // SL. If price has drifted closer to SL without momentum,
+                // tighten the SL adaptively. If trade has stalled 25+ bars
+                // with weak unrealized, exit at market — the move isn't
+                // coming, free the slot for a fresh setup.
+                let stallExit = false;
+                if(!this.tp1Hit && this.entryRisk > 0){
+                    const _unr = pos===1 ? c-this.ep : this.ep-c;
+                    const _distToTP = pos===1 ? (this.tp1 - c) : (c - this.tp1);
+                    const _distToSL = pos===1 ? (c - this.sl) : (this.sl - c);
+                    const _proximityToSL = _distToSL / Math.max(_distToSL + _distToTP, 0.01);
+                    // Stall: 25+ bars in, unrealized < 0.4R, momentum dying
+                    if(this.barsHeld >= 25 && Math.abs(_unr) < this.entryRisk * 0.4){
+                        // Check momentum dying: last 5 bars net move < 0.5 ATR
+                        if(n >= 6){
+                            const _recent = c - this.C[n - 6];
+                            if(Math.abs(_recent) < atr * 0.5){
+                                stallExit = true;
+                            }
+                        }
+                    }
+                    // Closer to SL than TP + against-direction momentum =
+                    // tighten SL to lock in any remaining value
+                    if(_proximityToSL < 0.35 && _unr < 0){
+                        // We've drifted way toward SL — pull SL halfway
+                        // closer to entry to cap loss
+                        const _newSL = pos===1
+                            ? this.sl + (this.ep - this.sl) * 0.3
+                            : this.sl - (this.sl - this.ep) * 0.3;
+                        if(pos===1)  this.sl = Math.max(this.sl, _newSL);
+                        if(pos===-1) this.sl = Math.min(this.sl, _newSL);
+                    }
+                }
+
                 const hitTP2    = pos===1  ? c>=this.tp2  : c<=this.tp2;
                 const hitSL     = pos===1  ? l<=this.sl   : h>=this.sl;
                 const hitTrail  = this.tp1Hit && (pos===1 ? c<=this.trailSL : c>=this.trailSL);
@@ -2146,7 +2181,7 @@ class MarketReader {
                 // the boundary into low liquidity / settlement gap.
                 const eodExit   = sessionEndExit;
 
-                if(hitTP2||hitSL||hitTrail||maxHit||eodExit||peakGiveBackExit||thesisBrokenExit||wyckoffEventExit){
+                if(hitTP2||hitSL||hitTrail||maxHit||eodExit||peakGiveBackExit||thesisBrokenExit||wyckoffEventExit||stallExit){
                     exitNow=true;
                     exitDir=pos;
                     exitPnl = pos===1 ? c-this.ep : this.ep-c;
@@ -2218,6 +2253,7 @@ class MarketReader {
                             jEntry.exitReason = hitTP2 ? 'TP2' :
                                                 hitSL ? 'SL' :
                                                 hitTrail ? 'TRAIL' :
+                                                stallExit ? 'STALL' :
                                                 wyckoffEventExit ? wyckoffEventReason :
                                                 thesisBrokenExit ? 'THESIS-BROKEN' :
                                                 peakGiveBackExit ? 'GIVE-BACK' :
@@ -2229,7 +2265,7 @@ class MarketReader {
                     this._logJournal(bi, this.sessKey, hhmmStr, 'EXIT', {
                         win: win,
                         pnl: Math.round(exitPnl*100)/100,
-                        reason: hitTP2?'TP2':hitSL?'SL':hitTrail?'TRAIL':wyckoffEventExit?wyckoffEventReason:thesisBrokenExit?'THESIS-BROKEN':peakGiveBackExit?'GIVE-BACK':eodExit?'EOD':'MAX-HOLD',
+                        reason: hitTP2?'TP2':hitSL?'SL':hitTrail?'TRAIL':stallExit?'STALL':wyckoffEventExit?wyckoffEventReason:thesisBrokenExit?'THESIS-BROKEN':peakGiveBackExit?'GIVE-BACK':eodExit?'EOD':'MAX-HOLD',
                         entryBar: this.entryBar,
                         ep: Math.round(this.ep*100)/100,
                         ex: Math.round(c*100)/100,
@@ -3029,15 +3065,23 @@ class MarketReader {
                     this.barsHeld    = 0;
                     this.barsSinceSig= 0;
                     this.dailyTrades++;
+                    // High-conviction setups get an extended TP2. When the
+                    // backtest measured edge to be top-quartile (score ≥7,
+                    // or a COIL fire which has measured +6pt/trade), push
+                    // TP2 from 2.5R to 3.5R to capture the full move.
+                    // Average winner of 1.34pt was 1:1 with avgL; widening
+                    // TP shifts R:R toward 1.7:1 on the trades that earn it.
+                    const _highConv = (decision.totalScore || 0) >= 7 || coilFire !== 0;
+                    const _tp2Mult = _highConv ? 3.5 : 2.5;
                     if(dir===1){
                         this.sl  = nearLevel ? Math.min(nearLevel.price-atr*0.8, c-rsk) : c-rsk;
                         this.tp1 = tps[0]||c+rsk*1.5;
-                        this.tp2 = tps[1]||c+rsk*2.5;
+                        this.tp2 = tps[1]||c+rsk*_tp2Mult;
                         newLong=true;
                     } else {
                         this.sl  = nearLevel ? Math.max(nearLevel.price+atr*0.8, c+rsk) : c+rsk;
                         this.tp1 = tps[0]||c-rsk*1.5;
-                        this.tp2 = tps[1]||c-rsk*2.5;
+                        this.tp2 = tps[1]||c-rsk*_tp2Mult;
                         newShort=true;
                     }
                     this.renderMap[bi]={

@@ -8,18 +8,24 @@
 const fs = require('fs');
 
 // ── LOAD DATA ──────────────────────────────────────────────────────────────
-const raw = JSON.parse(fs.readFileSync('/tmp/nq_test.json', 'utf8'));
-const r = raw.chart.result[0];
-const q = r.indicators.quote[0];
-const ts = r.timestamp;
+const fileArg = process.argv[2] || '/tmp/qqq_merged.json';
+const data = JSON.parse(fs.readFileSync(fileArg, 'utf8'));
 const bars = [];
-for (let i = 0; i < ts.length; i++) {
-    if (q.open[i] == null || q.close[i] == null) continue;
-    bars.push({
-        t: ts[i],
-        o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i],
-        v: q.volume[i] || 0,
-    });
+if (data.chart) {
+    // Yahoo Finance format
+    const r = data.chart.result[0];
+    const q = r.indicators.quote[0];
+    const ts = r.timestamp;
+    for (let i = 0; i < ts.length; i++) {
+        if (q.open[i] == null || q.close[i] == null) continue;
+        bars.push({ t:ts[i], o:q.open[i], h:q.high[i], l:q.low[i], c:q.close[i], v:q.volume[i]||0 });
+    }
+} else {
+    // Tiingo format — array of {date, open, high, low, close, volume}
+    for (const b of data) {
+        if (b.open == null || b.close == null) continue;
+        bars.push({ t: new Date(b.date).getTime()/1000, o:b.open, h:b.high, l:b.low, c:b.close, v:b.volume||0 });
+    }
 }
 console.log(`Loaded ${bars.length} bars (${new Date(bars[0].t*1000).toISOString().slice(0,10)} → ${new Date(bars[bars.length-1].t*1000).toISOString().slice(0,10)})`);
 

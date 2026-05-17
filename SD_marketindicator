@@ -471,8 +471,14 @@ class MarketReader {
                 wcLth=lth; wcLtm=ltm; wcDateStr=''; wcLagMin=0;
             }
             const isLive = wcDateStr !== '';
-            const bLth = isLive ? wcLth : lth;
-            const bLtm = isLive ? wcLtm : ltm;
+            // Always use the BAR's own timestamp for session detection.
+            // The previous wall-clock fallback caused session anchors to
+            // jump to whatever the live clock said when the chart loaded
+            // (e.g., a chart loaded at 8pm tagged recent bars as 8pm even
+            // when their actual ts was earlier — producing a fake "session
+            // change" at 8pm and resetting sigma/VWAP there).
+            const bLth = lth;
+            const bLtm = ltm;
             this.barLagMin = wcLagMin;
             // Format wall-clock time as HH:MM for journal entries
             const hhmmStr = (bLth<10?'0':'')+bLth+':'+(bLtm<10?'0':'')+bLtm;

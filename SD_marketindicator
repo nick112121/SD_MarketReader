@@ -2178,9 +2178,12 @@ class MarketReader {
                     }
                 }
 
-                const hitTP2    = pos===1  ? c>=this.tp2  : c<=this.tp2;
+                // Stops/targets are resting orders → trigger on the bar's
+                // EXTREME (intrabar), not the close. A wick through the stop
+                // is a fill even if the bar closes back the other side.
+                const hitTP2    = pos===1  ? h>=this.tp2  : l<=this.tp2;
                 const hitSL     = pos===1  ? l<=this.sl   : h>=this.sl;
-                const hitTrail  = this.tp1Hit && (pos===1 ? c<=this.trailSL : c>=this.trailSL);
+                const hitTrail  = this.tp1Hit && (pos===1 ? l<=this.trailSL : h>=this.trailSL);
                 const maxHit    = this.barsHeld >= MAX_HOLD;
                 // EOD risk close — force exit at session end regardless of
                 // P&L. Better to take whatever you have than hold through
@@ -2190,9 +2193,17 @@ class MarketReader {
                 if(hitTP2||hitSL||hitTrail||maxHit||eodExit||peakGiveBackExit||thesisBrokenExit||wyckoffEventExit||stallExit){
                     exitNow=true;
                     exitDir=pos;
-                    exitPnl = pos===1 ? c-this.ep : this.ep-c;
+                    // Book P&L at the price that ACTUALLY fired, not the close.
+                    // Straddle priority: stop/trail before target (assume the
+                    // adverse level filled first — conservative without tick data).
+                    let fillPx;
+                    if(hitSL)         fillPx = this.sl;
+                    else if(hitTrail) fillPx = this.trailSL;
+                    else if(hitTP2)   fillPx = this.tp2;
+                    else              fillPx = c;   // maxHold/EOD/give-back/stall/thesis = market @ close
+                    exitPnl = pos===1 ? fillPx - this.ep : this.ep - fillPx;
 
-                    const win = exitPnl >= 0;
+                    const win = exitPnl > 0;   // breakeven (scratch) is NOT a win
                     this.results.push({win, pnl:exitPnl});
                     if(this.results.length>5) this.results.shift();
                     this.sessPnl  += exitPnl;
@@ -2252,7 +2263,7 @@ class MarketReader {
                     for(let ji=this.journal.length-1; ji>=0 && ji>=this.journal.length-30; ji--){
                         const jEntry = this.journal[ji];
                         if(jEntry.type==='FIRED' && jEntry.bar===this.entryBar){
-                            jEntry.exitPrice = Math.round(c*100)/100;
+                            jEntry.exitPrice = Math.round(fillPx*100)/100;
                             jEntry.exitBar = bi;
                             jEntry.exitPnl = Math.round(exitPnl*100)/100;
                             jEntry.exitWin = win;
@@ -2274,7 +2285,7 @@ class MarketReader {
                         reason: hitTP2?'TP2':hitSL?'SL':hitTrail?'TRAIL':stallExit?'STALL':wyckoffEventExit?wyckoffEventReason:thesisBrokenExit?'THESIS-BROKEN':peakGiveBackExit?'GIVE-BACK':eodExit?'EOD':'MAX-HOLD',
                         entryBar: this.entryBar,
                         ep: Math.round(this.ep*100)/100,
-                        ex: Math.round(c*100)/100,
+                        ex: Math.round(fillPx*100)/100,
                         strength: this.lastStrengthScore,
                         votesAgainst: this.lastThesisAgainst
                     });
@@ -2679,14 +2690,22 @@ class MarketReader {
             }
 
             let blockReason = '';
+            // ── BLOCK PRECEDENCE (most punitive wins) ───────────────────
+            // Structural first, then HARD account-survival + PACING blocks,
+            // THEN the overridable MAX-TRADES, then setup-quality. HARD/PACING
+            // MUST sit above MAX-TRADES: the flip-override (below) may only
+            // relax MAX-TRADES, and it is reached only when canTrade is true.
+            // If MAX-TRADES could mask MAX-LOSS/HARD-STOP/LOSS-PAUSE, the
+            // override would silently bypass the daily loss cap.
             if(!timeOK)                                blockReason='TIME';
             else if(this.position!==0)                 blockReason='IN-POS';
             else if(sessionEndBlock)                   blockReason='EOD-BLOCK';
-            else if(this.dailyTrades>=maxTrades)       blockReason='MAX-TRADES';
-            else if(bi<=this.pauseUntilBar)            blockReason='LOSS-PAUSE';
-            else if(this.barsSinceSig<=5)              blockReason='COOLDOWN';
+            else if(n < WARM_BARS)                     blockReason='WARM-UP';
             else if(this.sessPnl*cv<=-maxLoss)         blockReason='MAX-LOSS';
             else if(_halfLossHit)                      blockReason='HARD-STOP';
+            else if(bi<=this.pauseUntilBar)            blockReason='LOSS-PAUSE';
+            else if(this.barsSinceSig<=5)              blockReason='COOLDOWN';
+            else if(this.dailyTrades>=maxTrades)       blockReason='MAX-TRADES';
             else if(dayQuality < 4)                    blockReason='DAY-QUALITY';
             else if(!(atLevel||isSweepEntry||coilFire!==0)) blockReason='NO-LEVEL';
             this.blockReason = blockReason;
@@ -2702,7 +2721,8 @@ class MarketReader {
             // blocked by structural reasons like TIME or IN-POS) gets
             // logged. This builds the "why didn't I take that?" trail.
             const structuralBlock = blockReason==='TIME' || blockReason==='IN-POS' ||
-                                    blockReason==='EOD-BLOCK' ||
+                                    blockReason==='EOD-BLOCK' || blockReason==='WARM-UP' ||
+                                    blockReason==='HARD-STOP' ||
                                     blockReason==='MAX-TRADES' || blockReason==='LOSS-PAUSE' ||
                                     blockReason==='COOLDOWN' || blockReason==='MAX-LOSS';
             if(!structuralBlock){
@@ -3009,10 +3029,17 @@ class MarketReader {
                     // the new direction is the whole point. Bounded to one use
                     // per session.
                     if(decision.fire && this.dailyTrades >= maxTrades){
+                        // The override may relax MAX-TRADES ONLY. Never let a
+                        // regime-flip reopen trading past the daily loss cap,
+                        // the hard-stop, or an active loss-pause. (Redundant
+                        // with block precedence above, kept as a hard guard.)
+                        const _overLoss  = this.sessPnl*cv <= -(maxLoss*0.5); // covers MAX-LOSS + HARD-STOP
+                        const _inPause   = bi <= this.pauseUntilBar;
                         const isFlip = this.lastLossDir !== 0 &&
                                        dir === -this.lastLossDir &&
                                        decision.totalScore >= 7 &&
-                                       !this.maxTradesOverrideUsed;
+                                       !this.maxTradesOverrideUsed &&
+                                       !_overLoss && !_inPause;
                         if(isFlip){
                             this.maxTradesOverrideUsed = true;
                             this.blockReason = '';

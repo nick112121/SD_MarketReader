@@ -20,16 +20,7 @@ app = FastAPI(title="Markov Dashboard")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 ASSETS: list[dict] = [
-    # Forex
-    {"label": "EUR/USD", "ticker": "EURUSD=X", "group": "Forex"},
-    {"label": "GBP/USD", "ticker": "GBPUSD=X", "group": "Forex"},
-    {"label": "USD/JPY", "ticker": "USDJPY=X", "group": "Forex"},
-    {"label": "GBP/JPY", "ticker": "GBPJPY=X", "group": "Forex"},
-    {"label": "EUR/GBP", "ticker": "EURGBP=X", "group": "Forex"},
-    {"label": "AUD/USD", "ticker": "AUDUSD=X", "group": "Forex"},
-    {"label": "USD/CAD", "ticker": "USDCAD=X", "group": "Forex"},
-    {"label": "EUR/JPY", "ticker": "EURJPY=X", "group": "Forex"},
-    # US Indices
+    # US Indices — the US stock-index futures (S&P / NASDAQ / Dow / Russell)
     {"label": "S&P 500",      "ticker": "SPY",      "group": "US Indices"},
     {"label": "NASDAQ 100",   "ticker": "QQQ",      "group": "US Indices"},
     {"label": "Dow Jones",    "ticker": "DIA",      "group": "US Indices"},
@@ -47,6 +38,15 @@ ASSETS: list[dict] = [
     {"label": "Netflix",   "ticker": "NFLX",  "group": "Nasdaq 100 Leaders"},
     {"label": "Costco",    "ticker": "COST",  "group": "Nasdaq 100 Leaders"},
     {"label": "AMD",       "ticker": "AMD",   "group": "Nasdaq 100 Leaders"},
+    # Forex
+    {"label": "EUR/USD", "ticker": "EURUSD=X", "group": "Forex"},
+    {"label": "GBP/USD", "ticker": "GBPUSD=X", "group": "Forex"},
+    {"label": "USD/JPY", "ticker": "USDJPY=X", "group": "Forex"},
+    {"label": "GBP/JPY", "ticker": "GBPJPY=X", "group": "Forex"},
+    {"label": "EUR/GBP", "ticker": "EURGBP=X", "group": "Forex"},
+    {"label": "AUD/USD", "ticker": "AUDUSD=X", "group": "Forex"},
+    {"label": "USD/CAD", "ticker": "USDCAD=X", "group": "Forex"},
+    {"label": "EUR/JPY", "ticker": "EURJPY=X", "group": "Forex"},
     # US Sectors
     {"label": "Technology",    "ticker": "XLK",  "group": "US Sectors"},
     {"label": "Financials",    "ticker": "XLF",  "group": "US Sectors"},

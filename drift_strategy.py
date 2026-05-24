@@ -6,15 +6,24 @@ persistent intraday DRIFT SHAPE (up mid-morning + into the close, down early
 afternoon) with large t-stats. This tests whether that shape is actually
 TRADEABLE, without fooling ourselves:
 
-  1. Split the basket of tickers in two.
-  2. On the TRAIN half, learn each 30-min bucket's drift direction (long/short).
-  3. On the held-out TEST half, trade those fixed directions, net of cost.
-  4. Report test expectancy + significance. If it holds out-of-sample, it's real.
+  1. Split the data (TEMPORAL by default: older dates train, newer dates test —
+     the honest test of whether drift carries into a future/other regime).
+  2. On TRAIN, learn each 30-min bucket's drift direction (long/short).
+  3. On the held-out TEST, trade those fixed directions, with a cost sweep.
+  4. Report test expectancy + significance.
 
-    python drift_strategy.py
+NOTE: a cross-TICKER split that shares the same time window will pass even when
+the edge is regime-specific (it fooled an earlier version of this study). Use
+the temporal split on multi-year data for the real answer.
+
+    python drift_strategy.py                              # yfinance basket (60d, ticker split)
+    python drift_strategy.py --json QQQ_long.json         # temporal split on a long file
+    python drift_strategy.py --json QQQ.json SPY.json --split temporal
 """
 
 from __future__ import annotations
+
+import argparse
 
 import numpy as np
 
@@ -41,26 +50,41 @@ def bucket_returns(sess: list) -> dict[int, list]:
     return out
 
 
-def fetch(tickers):
-    sess_by = {}
-    for t in tickers:
-        try:
-            sess_by[t] = sessions(load(t, "60d", None, None))
-        except Exception as exc:
-            print(f"  {t}: FAILED ({exc})")
-    return sess_by
+def make_splits(json_files, split):
+    """Return (train, test, desc). TEMPORAL = train on older dates, test on newer
+    (the honest test: does the drift carry to a future, possibly different regime).
+    TICKER = train on half the symbols, test on the others (shares time period)."""
+    if json_files:
+        sess_by = {f: sessions(load("", "", None, f)) for f in json_files}
+    else:
+        print("Fetching basket (5m/60d via yfinance)...")
+        sess_by = {}
+        for t in TICKERS:
+            try:
+                sess_by[t] = sessions(load(t, "60d", None, None))
+            except Exception as exc:
+                print(f"  {t}: FAILED ({exc})")
+    names = list(sess_by)
+    if split == "temporal" or len(names) == 1:
+        alls = sorted((s for n in names for s in sess_by[n]), key=lambda x: x[0])
+        cut = int(len(alls) * 0.6)
+        tr, te = alls[:cut], alls[cut:]
+        d = (f"TEMPORAL: train {tr[0][0]}..{tr[-1][0]} ({len(tr)}) -> "
+             f"test {te[0][0]}..{te[-1][0]} ({len(te)})")
+        return tr, te, d
+    tr = [s for n in names[0::2] for s in sess_by[n]]
+    te = [s for n in names[1::2] for s in sess_by[n]]
+    return tr, te, f"TICKER: train {names[0::2]} ({len(tr)}) -> test {names[1::2]} ({len(te)})"
 
 
 def main():
-    print("Fetching basket (5m/60d)...")
-    sess_by = fetch(TICKERS)
-    names = list(sess_by)
-    train_names = names[0::2]            # every other ticker -> train
-    test_names = names[1::2]             # the rest -> held-out test
-    train = [s for t in train_names for s in sess_by[t]]
-    test = [s for t in test_names for s in sess_by[t]]
-    print(f"train: {len(train_names)} names / {len(train)} sessions   "
-          f"test: {len(test_names)} names / {len(test)} sessions\n")
+    ap = argparse.ArgumentParser(description="Out-of-sample test of time-of-day drift.")
+    ap.add_argument("--json", nargs="+", help="one or more Tiingo JSON files (one per ticker)")
+    ap.add_argument("--split", choices=["temporal", "ticker"], default="temporal",
+                    help="temporal (default, honest) or ticker (shares regime)")
+    args = ap.parse_args()
+    train, test, desc = make_splits(args.json, args.split)
+    print(desc + "\n")
 
     # 1. learn bucket directions on TRAIN
     tr = bucket_returns(train)
@@ -96,7 +120,7 @@ def main():
     gt = np.array(gross_trades); dg = np.array(day_gross); dn = np.array(day_nbkt)
 
     print("\n" + "=" * 72)
-    print(f"  OUT-OF-SAMPLE RESULT  (test = {len(test_names)} held-out names, {len(test)} sessions)")
+    print(f"  OUT-OF-SAMPLE RESULT  ({len(test)} held-out test sessions)")
     print("=" * 72)
     print(f"  {'cost/side':>9} | {'bps/trade':>9} {'win%':>6} {'t':>6} {'p':>6} {'PF':>5} | "
           f"{'bps/day':>8} {'ann.%':>7}")

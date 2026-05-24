@@ -34,7 +34,12 @@ fills.
 
 ### Deploy (free, on Render)
 
-`render.yaml` is included, so deploying is mostly click-through:
+Easiest path — click this button, sign in with GitHub, and click **Apply**:
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/nick112121/SD_MarketReader)
+
+`render.yaml` is included, so Render fills in everything for you. If the button
+doesn't work, do it by hand:
 
 1. Push this repo to GitHub (already done if you're reading this there).
 2. Go to [render.com](https://render.com), sign in with GitHub.

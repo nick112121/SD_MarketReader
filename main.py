@@ -35,6 +35,18 @@ ASSETS: list[dict] = [
     {"label": "Dow Jones",    "ticker": "DIA",      "group": "US Indices"},
     {"label": "Russell 2000", "ticker": "IWM",      "group": "US Indices"},
     {"label": "VIX",          "ticker": "^VIX",     "group": "US Indices"},
+    # Nasdaq 100 Leaders — the heavyweight names that drive NQ futures
+    {"label": "Nvidia",    "ticker": "NVDA",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Apple",     "ticker": "AAPL",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Microsoft", "ticker": "MSFT",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Amazon",    "ticker": "AMZN",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Broadcom",  "ticker": "AVGO",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Meta",      "ticker": "META",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Alphabet",  "ticker": "GOOGL", "group": "Nasdaq 100 Leaders"},
+    {"label": "Tesla",     "ticker": "TSLA",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Netflix",   "ticker": "NFLX",  "group": "Nasdaq 100 Leaders"},
+    {"label": "Costco",    "ticker": "COST",  "group": "Nasdaq 100 Leaders"},
+    {"label": "AMD",       "ticker": "AMD",   "group": "Nasdaq 100 Leaders"},
     # US Sectors
     {"label": "Technology",    "ticker": "XLK",  "group": "US Sectors"},
     {"label": "Financials",    "ticker": "XLF",  "group": "US Sectors"},
@@ -60,6 +72,7 @@ ASSETS: list[dict] = [
 ]
 
 TF_CONFIG: dict[str, dict] = {
+    "5m":  {"interval": "5m",  "period": "60d",  "resample": None, "lookback": 48,  "threshold": 0.010},
     "15m": {"interval": "15m", "period": "60d",  "resample": None, "lookback": 48,  "threshold": 0.015},
     "1h":  {"interval": "1h",  "period": "730d", "resample": None, "lookback": 48,  "threshold": 0.020},
     "4h":  {"interval": "1h",  "period": "730d", "resample": "4h", "lookback": 42,  "threshold": 0.025},

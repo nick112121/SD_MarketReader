@@ -73,22 +73,35 @@ def to_ny(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
     return idx.tz_convert("America/New_York")
 
 
-def load(ticker: str, period: str, csv: str | None) -> pd.DataFrame:
-    if csv:
+def load(ticker: str, period: str, csv: str | None, json_path: str | None) -> pd.DataFrame:
+    if json_path:
+        import json as _json
+        with open(json_path) as f:
+            raw = _json.load(f)
+        d = pd.DataFrame(raw)
+        if "date" not in d.columns:
+            raise ValueError("JSON has no 'date' field (expected Tiingo IEX format)")
+        d["date"] = pd.to_datetime(d["date"], utc=True)        # Tiingo timestamps -> UTC
+        d = d.set_index("date").sort_index()
+        d = d.rename(columns={c: c.capitalize() for c in d.columns})
+    elif csv:
         d = pd.read_csv(csv)
         tcol = next(c for c in d.columns if c.lower() in ("datetime", "date", "timestamp", "time"))
         d[tcol] = pd.to_datetime(d[tcol], utc=True)
-        d = d.set_index(tcol)
-        d.columns = [c.capitalize() for c in d.columns]
+        d = d.set_index(tcol).sort_index()
+        d = d.rename(columns={c: c.capitalize() for c in d.columns})
     else:
         import yfinance as yf
         d = yf.download(ticker, period=period, interval="5m", progress=False, auto_adjust=True)
         if isinstance(d.columns, pd.MultiIndex):
             d.columns = d.columns.get_level_values(0)
-    d = d.dropna()
-    d = d.set_index(to_ny(d.index))
+    missing = {"Open", "High", "Low", "Close"} - set(d.columns)
+    if missing:
+        raise ValueError(f"missing OHLC columns: {missing} (have {list(d.columns)})")
+    d = d[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
+    d = d.set_index(to_ny(d.index))                            # -> America/New_York
     mins = d.index.hour * 60 + d.index.minute
-    return d[(mins >= RTH_OPEN) & (mins < RTH_CLOSE)]
+    return d[(mins >= RTH_OPEN) & (mins < RTH_CLOSE)]          # RTH only (drops pre/post mkt)
 
 
 def sessions(df: pd.DataFrame) -> list[tuple]:
@@ -381,17 +394,18 @@ def main():
     ap.add_argument("--or-bars", type=int, default=1, help="opening-range length in 5m bars")
     ap.add_argument("--cost", type=float, default=0.5, help="cost per side in bps")
     ap.add_argument("--csv", help="load 5m OHLC from CSV instead of yfinance")
+    ap.add_argument("--json", help="load 5m OHLC from a Tiingo IEX JSON file")
     args = ap.parse_args()
     try:
-        df = load(args.ticker, args.period, args.csv)
+        df = load(args.ticker, args.period, args.csv, args.json)
     except Exception as exc:
         print(f"[!] Could not load data: {exc}")
-        print("    Run locally with internet, or pass --csv.")
+        print("    Run locally with internet, or pass --csv / --json.")
         return
     if len(df) < 600:
         print(f"[!] Only {len(df)} bars — need more for a meaningful test.")
         return
-    run(df, args.cost, args.or_bars, args.csv or f"{args.ticker} 5m {args.period}")
+    run(df, args.cost, args.or_bars, args.json or args.csv or f"{args.ticker} 5m {args.period}")
 
 
 if __name__ == "__main__":

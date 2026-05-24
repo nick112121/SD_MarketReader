@@ -114,7 +114,21 @@ def load_csv(path: str) -> pd.DataFrame:
     d[tcol] = pd.to_datetime(d[tcol], utc=True)
     d = d.set_index(tcol).sort_index()
     d.columns = [c.capitalize() for c in d.columns]
-    return d[["Open", "High", "Low", "Close"]].dropna()
+    return d[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
+
+
+def load_json(path: str) -> pd.DataFrame:
+    """Tiingo IEX JSON: list of {date, open, high, low, close, volume}. Use 1min freq."""
+    import json as _json
+    with open(path) as f:
+        raw = _json.load(f)
+    d = pd.DataFrame(raw)
+    if "date" not in d.columns:
+        raise ValueError("JSON has no 'date' field (expected Tiingo IEX format)")
+    d["date"] = pd.to_datetime(d["date"], utc=True)
+    d = d.set_index("date").sort_index()
+    d = d.rename(columns={c: c.capitalize() for c in d.columns})
+    return d[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
 
 
 def synthetic(days: int = 30, seed: int = 7) -> pd.DataFrame:
@@ -339,12 +353,15 @@ def main():
     ap.add_argument("--horizons", default="10,20,30", help="exit horizons in minutes, comma-sep")
     ap.add_argument("--cost", type=float, default=0.5, help="cost per side in bps")
     ap.add_argument("--csv", help="load 1m OHLC from CSV instead of yfinance")
+    ap.add_argument("--json", help="load 1m OHLC from a Tiingo IEX JSON file")
     ap.add_argument("--synthetic", action="store_true", help="random-walk sanity check (expect no edge)")
     args = ap.parse_args()
     horizons = [int(h) for h in args.horizons.split(",")]
 
     if args.synthetic:
         df, label = synthetic(args.days), "SYNTHETIC random walk"
+    elif args.json:
+        df, label = load_json(args.json), f"JSON {args.json}"
     elif args.csv:
         df, label = load_csv(args.csv), f"CSV {args.csv}"
     else:

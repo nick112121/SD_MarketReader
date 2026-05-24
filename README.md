@@ -32,14 +32,24 @@ uvicorn main:app --reload
 Then open http://127.0.0.1:8000. The first load takes ~30s while the cache
 fills.
 
-### Deploy
+### Deploy (free, on Render)
 
-`runtime.txt` pins Python 3.12 and `Procfile` defines the web process, so the
-app deploys to any PaaS that supports them (Railway, Render, Heroku, etc.):
+`render.yaml` is included, so deploying is mostly click-through:
 
-```
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
-```
+1. Push this repo to GitHub (already done if you're reading this there).
+2. Go to [render.com](https://render.com), sign in with GitHub.
+3. **New → Blueprint**, pick this repo, and Render reads `render.yaml`
+   automatically. Click **Apply**.
+
+Or set it up by hand with **New → Web Service** and these settings:
+
+- **Build command:** `pip install -r requirements.txt`
+- **Start command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+
+Render gives you a public URL like `markov-dashboard.onrender.com`. On the free
+tier the app sleeps after ~15 min idle, so the first visit after a nap takes
+~30–60s to wake up and fill its cache. `Procfile` + `runtime.txt` are also
+included for Railway / Heroku-style hosts.
 
 Data is delayed 15–20 min via Yahoo Finance. **Not financial advice.**
 

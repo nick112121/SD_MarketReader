@@ -41,7 +41,9 @@ def nq_sessions():
     return pd.DataFrame({"open": g.first(), "high": g.max(), "low": g.min(), "close": g.last()})
 
 
-def walls_by_date():
+def walls_by_date(ref):
+    """ref: dict date->NQ EOD close. Walls computed from NEAR-THE-MONEY strikes
+    only (far-OTM tail OI isn't a pin)."""
     defn = pd.read_parquet("/tmp/nq_opt_def.parquet")
     oi = pd.read_parquet("/tmp/nq_opt_oi.parquet")
     val = "quantity" if oi["quantity"].abs().sum() > oi["price"].abs().sum() else "price"
@@ -52,16 +54,22 @@ def walls_by_date():
     m["exp"] = to_ny(pd.DatetimeIndex(m["expiration"])).date
     out = {}
     for d, day in m.groupby("date"):
+        px = ref.get(d)
+        if px is None or np.isnan(px):
+            continue
         future = day[day["exp"] >= d]
         if future.empty:
             continue
         front = future[future["exp"] == future["exp"].min()]      # nearest expiry
+        lo, hi = px * 0.95, px * 1.05                              # near-the-money only
+        front = front[(front["strike_price"] >= lo) & (front["strike_price"] <= hi)]
         calls = front[front["instrument_class"] == "C"].groupby("strike_price")["oi"].sum()
         puts = front[front["instrument_class"] == "P"].groupby("strike_price")["oi"].sum()
-        if calls.empty or puts.empty:
+        if len(calls) < 2 or len(puts) < 2:
             continue
-        call_wall = float(calls.idxmax()); put_wall = float(puts.idxmax())
-        # max pain: strike minimising sum of ITM payout to holders
+        ca = calls[calls.index >= px]; pu = puts[puts.index <= px]   # walls on correct side
+        call_wall = float((ca if len(ca) else calls).idxmax())
+        put_wall = float((pu if len(pu) else puts).idxmax())
         strikes = np.union1d(calls.index.values, puts.index.values)
         pain = []
         for K in strikes:
@@ -76,7 +84,7 @@ def walls_by_date():
 
 def main():
     sess = nq_sessions()
-    walls = walls_by_date()
+    walls = walls_by_date(sess["close"].to_dict())
     dates = sorted(walls)
     rows = []
     for i in range(len(dates) - 1):

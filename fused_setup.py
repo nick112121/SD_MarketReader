@@ -45,8 +45,8 @@ def load_1m():
 
 
 def daily_em():
-    defn = pd.read_parquet("/tmp/nq_def_2y.parquet")
-    st = pd.read_parquet("/tmp/nq_settle_2y.parquet")
+    defn = pd.read_parquet("/tmp/nq_def_6m.parquet")
+    st = pd.read_parquet("/tmp/nq_settle_6m.parquet")
     st["date"] = to_ny(pd.DatetimeIndex(st["ts_event"])).date
     m = st.merge(defn, on="instrument_id", how="inner")
     m["exp"] = to_ny(pd.DatetimeIndex(m["expiration"])).date
@@ -137,14 +137,12 @@ def main():
     em = daily_em()
     print(f"1m sessions: {b['date'].nunique()}   EM dates: {len(em)}")
     tr = backtest(b, em, args.tpr, args.cost_ticks)
-    tr_f = backtest(b, em, args.tpr, args.cost_ticks, fade=True)
     cut = tr["date"].quantile(0.6) if len(tr) else None
 
     print("="*72)
     print(f"  FUSED SETUP  (ORB continuation, TP {args.tpr}R, cost {args.cost_ticks}tk)")
     print("="*72)
     print(f"  ALL days continuation : {stats(tr['R'])}")
-    print(f"  ALL days FADE (control): {stats(tr_f['R'])}")
     has_em = tr.dropna(subset=["emrank"])
     hi = has_em[has_em["emrank"] >= 0.66]; lo = has_em[has_em["emrank"] <= 0.33]
     print(f"  HIGH expected-move days: {stats(hi['R'])}")

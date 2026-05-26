@@ -176,6 +176,10 @@ class MarketReader {
         this.weekOpen=0; this.wk1H=0; this.wk1L=0;
         this.monthKey=''; this.monthOpen=0; this.mo1H=0; this.mo1L=0;
         this.weekOpenBar=0; this.monthOpenBar=0;
+        // 9:30 RTH (NY) open — the daily EM bands anchor here, NOT at the
+        // current session open. Holds this morning's open through the EVE/
+        // Asia/London sessions until the next NY open fires.
+        this.rthOpen=0; this.rthOpenBar=0;
         this.calDayKey=''; this.calDayH=0; this.calDayL=999999;
         this.sessRanges=[]; this.avgSessRange=0;
         this.voids=[];
@@ -837,6 +841,9 @@ class MarketReader {
                 this.sessOpen    = o;
                 this.sessHigh    = h; this.sessLow = l;
                 this.sessOpenBar = bi;
+                // Latch the 9:30 RTH open so the daily EM bands stay pinned to
+                // this morning's open across every later session of the day.
+                if(sessSuffix==='_ny'){ this.rthOpen=o; this.rthOpenBar=bi; }
                 this.vwapN=0; this.vwapD=0; this.vwap=o;
                 this.cumDelta=0;
                 this.dailyTrades=0; this.sessPnl=0;
@@ -947,6 +954,8 @@ class MarketReader {
                     this.sessOpen = o;
                     this.sessHigh = h; this.sessLow = l;
                     this.sessOpenBar = bi;
+                    // Latch this morning's 9:30 open for the daily EM anchor.
+                    if(_isNYOpenBar){ this.rthOpen = o; this.rthOpenBar = bi; }
                     this._computeEXP(o);
                 }
             }
@@ -1859,7 +1868,10 @@ class MarketReader {
             // EM_DAILY constant at the top of the file (so bands always draw).
             let _emDLive = (this.props && Number(this.props.expMoveDaily)) || 0;
             if(!(_emDLive > 0)) _emDLive = EM_DAILY;
-            const _emAnchor = this.sessOpen > 0 ? this.sessOpen : c;
+            // Match the line anchor: this morning's 9:30 RTH open, with the
+            // current session open / last close only as a cold-start fallback.
+            const _emAnchor = this.rthOpen > 0 ? this.rthOpen
+                            : this.sessOpen > 0 ? this.sessOpen : c;
             if(_drawEMFallback && _emDLive > 0){
                 _emLine('em_d_1h', _emAnchor+_emDLive*0.5, '#00CCFF', 2, 1.0, 'D +0.5EM');
                 _emLine('em_d_1l', _emAnchor-_emDLive*0.5, '#00CCFF', 2, 1.0, 'D -0.5EM');
@@ -4469,16 +4481,26 @@ class MarketReader {
                       sk.includes('_asia')   ? 175 :
                                                 150;
         const calRange = this.calDayH>0&&this.calDayL<999999 ? this.calDayH-this.calDayL : 0;
-        const emDaily = (this.props && this.props.expMoveDaily) || 0;
-        this.expMid = open;
+        // Prefer the param if Tradovate passes it; otherwise fall back to the
+        // EM_DAILY constant at the top of the file. Tradovate doesn't reliably
+        // pass custom number params to the calculator, so the constant is what
+        // keeps the bands alive — and keeping emDaily>0 forces the input branch
+        // (expDailyIsInput=true), which is what routes the bands through the
+        // working canvas plotter so the LINES actually draw.
+        let emDaily = (this.props && Number(this.props.expMoveDaily)) || 0;
+        if(!(emDaily > 0)) emDaily = EM_DAILY;
+        // Anchor the daily bands at this morning's 9:30 RTH open, not the
+        // current (EVE/Asia/London) session open.
+        const anchor = (this.rthOpen > 0) ? this.rthOpen : open;
+        this.expMid = anchor;
         if(emDaily > 0){
             this.expDailyIsInput = true;
             // TRUE options expected-move levels: 0.5σ/1σ/1.5σ/2σ of the implied
             // daily move (the ATM straddle). No historical-range floor.
-            this.exp1H=open+emDaily*0.5; this.exp1L=open-emDaily*0.5;
-            this.exp2H=open+emDaily;     this.exp2L=open-emDaily;
-            this.exp3H=open+emDaily*1.5; this.exp3L=open-emDaily*1.5;
-            this.exp4H=open+emDaily*2.0; this.exp4L=open-emDaily*2.0;
+            this.exp1H=anchor+emDaily*0.5; this.exp1L=anchor-emDaily*0.5;
+            this.exp2H=anchor+emDaily;     this.exp2L=anchor-emDaily;
+            this.exp3H=anchor+emDaily*1.5; this.exp3L=anchor-emDaily*1.5;
+            this.exp4H=anchor+emDaily*2.0; this.exp4L=anchor-emDaily*2.0;
         } else {
             this.expDailyIsInput = false;
             let base = this.avgSessRange>0 ? this.avgSessRange

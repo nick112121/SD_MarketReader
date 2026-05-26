@@ -155,6 +155,11 @@ class MarketReader {
         this.exp3H=0; this.exp3L=0;
         this.exp4H=0; this.exp4L=0;
         this.expMid=0;
+        // Weekly / monthly expected-move bands (anchored at the week/month open,
+        // tracked by timestamp so tick charts work the same as time charts).
+        // (weekKey is already declared above with the prev-week H/L tracking.)
+        this.weekOpen=0; this.wk1H=0; this.wk1L=0;
+        this.monthKey=''; this.monthOpen=0; this.mo1H=0; this.mo1L=0;
         this.calDayKey=''; this.calDayH=0; this.calDayL=999999;
         this.sessRanges=[]; this.avgSessRange=0;
         this.voids=[];
@@ -740,11 +745,21 @@ class MarketReader {
                     this.prevWeekHigh = this.weekHigh;
                     this.prevWeekLow  = this.weekLow;
                 }
-                this.weekKey=weekKey; this.weekHigh=h; this.weekLow=l;
+                this.weekKey=weekKey; this.weekHigh=h; this.weekLow=l; this.weekOpen=o;
             } else if(isNewBar) {
                 if(h>this.weekHigh) this.weekHigh=h;
                 if(l<this.weekLow)  this.weekLow=l;
             }
+            // Monthly anchor + weekly/monthly expected-move bands (anchored at
+            // the week/month open; sized from the pasted straddle params).
+            const _monthKey = wkBase.y+'-'+wkBase.m;
+            if(isNewBar && _monthKey!==this.monthKey){ this.monthKey=_monthKey; this.monthOpen=o; }
+            const _emW=(p.expMoveWeekly!=null?p.expMoveWeekly:0)||0;
+            const _emM=(p.expMoveMonthly!=null?p.expMoveMonthly:0)||0;
+            this.wk1H=(this.weekOpen>0&&_emW>0)?this.weekOpen+_emW:0;
+            this.wk1L=(this.weekOpen>0&&_emW>0)?this.weekOpen-_emW:0;
+            this.mo1H=(this.monthOpen>0&&_emM>0)?this.monthOpen+_emM:0;
+            this.mo1L=(this.monthOpen>0&&_emM>0)?this.monthOpen-_emM:0;
 
             // ── DAILY CANDLE — futures-session boundary at 5 PM EDT ──
             let fLth, fY, fM, fD;
@@ -1563,6 +1578,8 @@ class MarketReader {
                 _ret.exp4H=this.exp4H; _ret.exp4L=this.exp4L;
                 _ret.expM=this.expMid;
             }
+            _ret.weekId=this.weekKey; _ret.wkH=this.wk1H; _ret.wkL=this.wk1L;
+            _ret.monthId=this.monthKey; _ret.moH=this.mo1H; _ret.moL=this.mo1L;
 
             const readyTime = sessSuffix !== '_overnight' ||
                               (tNY && (bLth===9 || (bLth===8&&bLtm>=30)));
@@ -5893,6 +5910,20 @@ function expPlotter(canvas, indicator, history){
         if(e3L) canvas.drawLine(pt.offset(sx,e3L), pt.offset(ex,e3L), {color:'#FFEE00',lineWidth:1,opacity:0.75});
         if(e4H) canvas.drawLine(pt.offset(sx,e4H), pt.offset(ex,e4H), {color:'#FF2244',lineWidth:2,opacity:0.9});
         if(e4L) canvas.drawLine(pt.offset(sx,e4L), pt.offset(ex,e4L), {color:'#FF2244',lineWidth:2,opacity:0.9});
+        // Weekly (purple) / monthly (pink) expected-move bands, anchored at the
+        // week/month open and spanning across the chart.
+        let wkH=null,wkL=null,wkSx=null, moH=null,moL=null,moSx=null;
+        const curWk=indicator.weekKey, curMo=indicator.monthKey;
+        for(let i=0;i<history.data.length;i++){
+            const it=history.get(i); if(!it) continue;
+            const xx=pt.x.get(it);
+            if(it.weekId===curWk && it.wkH>0){ if(wkSx===null) wkSx=xx; wkH=it.wkH; wkL=it.wkL; }
+            if(it.monthId===curMo && it.moH>0){ if(moSx===null) moSx=xx; moH=it.moH; moL=it.moL; }
+        }
+        if(wkH){ canvas.drawLine(pt.offset(wkSx,wkH),pt.offset(ex,wkH),{color:'#B388FF',lineWidth:2,opacity:0.8});
+                 canvas.drawLine(pt.offset(wkSx,wkL),pt.offset(ex,wkL),{color:'#B388FF',lineWidth:2,opacity:0.8}); }
+        if(moH){ canvas.drawLine(pt.offset(moSx,moH),pt.offset(ex,moH),{color:'#FF88DD',lineWidth:2,opacity:0.7});
+                 canvas.drawLine(pt.offset(moSx,moL),pt.offset(ex,moL),{color:'#FF88DD',lineWidth:2,opacity:0.7}); }
     } catch(e){}
 }
 
@@ -5911,6 +5942,10 @@ module.exports = {
         // to the average session range — the original behaviour). When set, the
         // sigma bands become TRUE expected-move levels: 0.5s / 1s / 1.5s / 2s.
         expMoveDaily: predef.paramSpecs.number(0, 25, 0),
+        // Weekly / monthly 1-sigma expected move in points (the weekly and
+        // monthly ATM straddles). 0 = off. Anchored at the week/month open.
+        expMoveWeekly:  predef.paramSpecs.number(0, 50, 0),
+        expMoveMonthly: predef.paramSpecs.number(0, 100, 0),
         // contractValuePt: $/point per contract. Set to 0 (default) to
         // let the indicator auto-detect from the instrument profile —
         // MNQ=$2, MGC=$10. Override only if you trade full contracts

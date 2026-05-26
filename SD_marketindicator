@@ -32,6 +32,13 @@ const plottingTools  = require('./tools/plotting');
 
 // ── CONSTANTS ────────────────────────────────────────────────────────────
 const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast)
+// ── DAILY EXPECTED MOVE (points) ──────────────────────────────────────────
+// EDIT THIS NUMBER each morning (1-sigma ATM straddle from the EM page).
+// Used directly so the bands always draw, even if Tradovate doesn't pass the
+// expMoveDaily setting. If the setting DOES come through, it overrides this.
+const EM_DAILY   = 200;
+const EM_WEEKLY  = 0;    // optional: weekly 1-sigma in points (0 = off)
+const EM_MONTHLY = 0;    // optional: monthly 1-sigma in points (0 = off)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
 const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)
@@ -1004,8 +1011,10 @@ class MarketReader {
             // Monthly anchor + weekly/monthly expected-move bands (options-implied)
             const _monthKey = wkBase.y+'-'+wkBase.m;
             if(isNewBar && _monthKey!==this.monthKey){ this.monthKey=_monthKey; this.monthOpen=o; this.monthOpenBar=bi; }
-            const _emW=(p.expMoveWeekly!=null?p.expMoveWeekly:0)||0;
-            const _emM=(p.expMoveMonthly!=null?p.expMoveMonthly:0)||0;
+            let _emW=(p.expMoveWeekly!=null?Number(p.expMoveWeekly):0)||0;
+            if(!(_emW>0)) _emW=EM_WEEKLY;
+            let _emM=(p.expMoveMonthly!=null?Number(p.expMoveMonthly):0)||0;
+            if(!(_emM>0)) _emM=EM_MONTHLY;
             this.wk1H=(this.weekOpen>0&&_emW>0)?this.weekOpen+_emW:0;
             this.wk1L=(this.weekOpen>0&&_emW>0)?this.weekOpen-_emW:0;
             this.mo1H=(this.monthOpen>0&&_emM>0)?this.monthOpen+_emM:0;
@@ -1846,7 +1855,10 @@ class MarketReader {
             // Live daily EM — read expMoveDaily every render and anchor at the
             // session open, so the bands appear the instant you set the param
             // (no dependency on the session-open recompute / stale flag).
-            const _emDLive = (this.props && this.props.expMoveDaily) || 0;
+            // Prefer the setting if Tradovate passes it; otherwise use the
+            // EM_DAILY constant at the top of the file (so bands always draw).
+            let _emDLive = (this.props && Number(this.props.expMoveDaily)) || 0;
+            if(!(_emDLive > 0)) _emDLive = EM_DAILY;
             const _emAnchor = this.sessOpen > 0 ? this.sessOpen : c;
             if(_drawEMFallback && _emDLive > 0){
                 _emLine('em_d_1h', _emAnchor+_emDLive*0.5, '#00CCFF', 2, 1.0, 'D +0.5EM');

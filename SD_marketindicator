@@ -1874,7 +1874,7 @@ class MarketReader {
             }
             if(_drawEMFallback && _emDLive<=0 && this.wk1H<=0 && this.mo1H<=0){
                 _items.push({tag:'Text', key:'em_status_off',
-                    text:'EM OFF: set expMoveDaily / Weekly / Monthly > 0',
+                    text:'EM OFF — code sees expMoveDaily = '+((this.props&&this.props.expMoveDaily)!=null?this.props.expMoveDaily:'undefined')+'  (re-add indicator if this stays 0)',
                     point:{x:_emLabelX, y:du(c + atr*1.8)},
                     style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FFCC44'},
                     textAlignment:'leftMiddle', global:true});
@@ -7087,9 +7087,9 @@ module.exports = {
         // Expected-move levels (options-implied). Paste the 1-sigma ATM straddle
         // in points per horizon. 0 = off (falls back to historical-range sigmas).
         // Daily drives the sigma bands; weekly/monthly draw their own.
-        expMoveDaily:   predef.paramSpecs.number(0, 1, 0),
-        expMoveWeekly:  predef.paramSpecs.number(0, 1, 0),
-        expMoveMonthly: predef.paramSpecs.number(0, 1, 0),
+        expMoveDaily:   predef.paramSpecs.number(200, 25, 0),
+        expMoveWeekly:  predef.paramSpecs.number(0, 25, 0),
+        expMoveMonthly: predef.paramSpecs.number(0, 25, 0),
         // 0 = hide historical fallback sigmas from the chart. They remain
         // available internally, but only true user-entered expected moves
         // draw by default.

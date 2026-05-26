@@ -34,6 +34,7 @@ const plottingTools  = require('./tools/plotting');
 const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
+const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)
 
 class MarketReader {
 
@@ -150,16 +151,24 @@ class MarketReader {
         this.weekHigh=0; this.weekLow=999999;
         this.prevWeekHigh=0; this.prevWeekLow=0;
         this.vwapN=0; this.vwapD=0; this.vwap=0;
+        // Safety-net date stamp for the daily NY 9:30 sigma refresh (set
+        // when sigma is recomputed; compared on each new bar).
+        this.sigmaRefreshDate = '';
         this.exp1H=0; this.exp1L=0;
+        // Sigma-level respect tracking. For each level (1H/1L/2H/2L/3H/3L/4H/4L)
+        // count touches, reversals, and break-throughs to measure whether
+        // price actually respects the computed levels.
+        this.sigmaStats = {};
+        this.pendingSigma = {};   // { key: {hitBar, levelPrice, side, hitFromAbove} }
         this.exp2H=0; this.exp2L=0;
         this.exp3H=0; this.exp3L=0;
         this.exp4H=0; this.exp4L=0;
         this.expMid=0;
-        // Weekly / monthly expected-move bands (anchored at the week/month open,
-        // tracked by timestamp so tick charts work the same as time charts).
-        // (weekKey is already declared above with the prev-week H/L tracking.)
+        this.expDailyIsInput=false;
+        // Weekly/monthly expected-move bands (anchored at week/month open).
         this.weekOpen=0; this.wk1H=0; this.wk1L=0;
         this.monthKey=''; this.monthOpen=0; this.mo1H=0; this.mo1L=0;
+        this.weekOpenBar=0; this.monthOpenBar=0;
         this.calDayKey=''; this.calDayH=0; this.calDayL=999999;
         this.sessRanges=[]; this.avgSessRange=0;
         this.voids=[];
@@ -210,6 +219,7 @@ class MarketReader {
         // earlier in this method alongside BOS state — don't re-init here
         // or we'd zero out values set by the earlier block.
         this.position=0;
+        this.qty=1;            // contracts for current trade (risk-based sizing, H4)
         this.ep=0; this.sl=0;
         this.tp1=0; this.tp2=0;
         this.tp1Hit=false; this.trailSL=0;
@@ -222,6 +232,22 @@ class MarketReader {
         this.lastStrengthScore=5;
         this.lastThesisAgainst=0;
         this.sigBehavior=''; this.sigLevel='';
+        // Repeat-failed-setup guard: don't re-fire same dir+level shortly after a loss.
+        this.lastLossBar=-9999; this.lastLossDir=0; this.lastLossLevel='';
+        // Regime-flip override: one extra trade allowed past MAX-TRADES if the
+        // setup is opposite-direction high-conviction (per session).
+        this.maxTradesOverrideUsed = false;
+        // Volatility-by-hour profile: rolling avg range per 15-min bucket.
+        // Accumulates across sessions so hot windows emerge over time.
+        this.volBins = {};
+        // Initial Balance: first 60 min of NY session sets the day's range.
+        // A clean break + hold of IB high/low marks a trend day; we then
+        // block counter-trend setups for the rest of the session.
+        this.ibHigh = 0; this.ibLow = 0;
+        this.ibStartBar = -1;
+        this.ibLocked = false;
+        this.ibBroken = 0;        // 0 = unbroken, 1 = up, -1 = down
+        this.ibBreakBars = 0;     // consecutive bars holding outside IB
         this.entryBar=0; this.barsHeld=0; this.barsSinceSig=0;
         this.entryChartIdx=null;  // chart index at entry (for line rendering)
         this.results=[];
@@ -230,6 +256,41 @@ class MarketReader {
         this.pauseUntilBar=-1;
         this.totalW=0; this.totalL=0; this.totalPnl=0;
         // Per-behavior performance buckets — auto-disable losers
+        // ── COIL DETECTION ────────────────────────────────────
+        // Volatility compression → expansion pattern. Measured edge:
+        // 4:1 favorable/adverse over 20 bars across 3.5 years of QQQ
+        // data (NQ proxy). Direction = breakout bar's direction.
+        // Down-breakouts historically hit harder (74% vs 58% WR).
+        this.coilActive = false;       // true when a tight cluster is forming
+        this.coilHi = 0; this.coilLo = 0;
+        this.coilStartBar = -1;
+        this.lastCoilBreakBar = -9999; // for cooldown after a breakout fires
+
+        // ── DELTA BUBBLES ─────────────────────────────────────
+        // Per-bar largest bid-ask imbalance at a price level. Detected by
+        // bucketing the bar's volume profile into N-tick slots and finding
+        // the slot with the biggest |askVol - bidVol|. Stored as a rolling
+        // history so entry/exit logic can reference recent bubbles.
+        // Bubble shape: { bar, price, delta, ts }
+        this.bubbles = [];
+        // Running average of |bubble delta| — updated as new bubbles
+        // print, used to scale the contra/hold thresholds adaptively per
+        // chart. Different tick charts (e.g., NY 4096-tick vs EVE 3072-
+        // tick) have different baseline volume, so an absolute threshold
+        // is misleading. Using avg × multiplier auto-tunes to each chart.
+        this.bubbleAvgAbs = 0;
+
+        // ── MARKET-STATE RECOGNITION ──────────────────────────
+        // Each bar we classify the market into one of 6 regimes so
+        // downstream filters can adapt. Plus per-state setup stats
+        // (online learning lite — each fired trade's outcome is
+        // bucketed by the state it entered in, building a running
+        // win-rate per (state, setup) we can gate on.
+        this.marketState = 'NEUTRAL';     // current classified state
+        this.marketStateBar = -1;         // last bar we recomputed
+        this.entryState = '';             // state at entry of current pos
+        // stateStats[state][setupTag] = {w, l, pnl}
+        this.stateStats = {};
         this.behaviorStats = {
             SWP:{w:0,l:0,pnl:0},
             CLX:{w:0,l:0,pnl:0},
@@ -353,17 +414,38 @@ class MarketReader {
                           ? p.contractValuePt
                           : this.autoContractValue;
             const maxLoss   = p.maxDailyLoss   || 400;
-            const maxTrades = p.maxDailyTrades  || 3;
+            const maxTrades = (p.maxDailyTrades != null) ? p.maxDailyTrades : 8;  // N6: align with paramSpec default (was ||3)
+            const riskPerTrade  = (p.riskPerTrade!=null ? p.riskPerTrade : 100);
+            const maxContracts  = (p.maxContracts && p.maxContracts > 0) ? p.maxContracts : 10;
 
             const o=d.open(), h=d.high(), l=d.low(), c=d.close();
 
-            // ── INSTRUMENT AUTO-DETECTION (first valid bar) ──
-            // Detects whether we're on NQ-magnitude prices (>10000) or
-            // Gold-magnitude (1500-10000). Sets the four price-sensitive
-            // constants accordingly. For other instruments, falls back
-            // to a price-relative profile that scales reasonably.
+            // ── BAD-DATA FRONT DOOR (H2 — fail closed) ──────────────────
+            // One non-finite or non-positive print would poison ATR (NaN
+            // propagates through the EMA forever), making every ATR-derived
+            // stop NaN → 'l<=sl' is always false → the stop NEVER fires.
+            // Reject the bar entirely: don't append it, don't advance state,
+            // don't trade on it. The next valid bar resumes normally.
+            if(!(Number.isFinite(o) && Number.isFinite(h) &&
+                 Number.isFinite(l) && Number.isFinite(c)) ||
+               o<=0 || h<=0 || l<=0 || c<=0 || h<l){
+                this.badBarCount = (this.badBarCount||0) + 1;
+                this.lastBadBar = true;
+                return;   // skip this update; internal state stays clean
+            }
+            this.lastBadBar = false;
+
+            // ── INSTRUMENT PROFILE (M2 — explicit beats guessing) ──
+            // p.instrument: 0=auto, 1=NQ/MNQ, 2=GC/MGC. Auto still detects
+            // NQ vs GC from price magnitude, but the front door above means
+            // the seeding bar is always valid (no single-bad-bar mis-lock),
+            // and an explicit setting removes the guess entirely (so e.g. ES
+            // near 5000 is no longer silently treated as Gold).
+            const _instParam = p.instrument || 0;
             if(!this._profileLoaded && c > 0){
-                if(c > 10000){
+                const _isNQ = _instParam === 1 || (_instParam === 0 && c > 10000);
+                const _isGC = _instParam === 2 || (_instParam === 0 && c > 1500 && c <= 10000);
+                if(_isNQ){
                     // NQ family (NQ, MNQ at 15000+)
                     this._instrument = 'NQ';
                     this.tickSize = 0.25;
@@ -371,7 +453,7 @@ class MarketReader {
                     this.minSessionRange = 50;
                     this.atrFloor = 0.25;
                     this.autoContractValue = 2;   // MNQ default ($2/pt)
-                } else if(c > 1500){
+                } else if(_isGC){
                     // Gold family (GC, MGC at 1800-4500)
                     this._instrument = 'GC';
                     this.tickSize = 0.10;
@@ -416,8 +498,14 @@ class MarketReader {
                 wcLth=lth; wcLtm=ltm; wcDateStr=''; wcLagMin=0;
             }
             const isLive = wcDateStr !== '';
-            const bLth = isLive ? wcLth : lth;
-            const bLtm = isLive ? wcLtm : ltm;
+            // Always use the BAR's own timestamp for session detection.
+            // The previous wall-clock fallback caused session anchors to
+            // jump to whatever the live clock said when the chart loaded
+            // (e.g., a chart loaded at 8pm tagged recent bars as 8pm even
+            // when their actual ts was earlier — producing a fake "session
+            // change" at 8pm and resetting sigma/VWAP there).
+            const bLth = lth;
+            const bLtm = ltm;
             this.barLagMin = wcLagMin;
             // Format wall-clock time as HH:MM for journal entries
             const hhmmStr = (bLth<10?'0':'')+bLth+':'+(bLtm<10?'0':'')+bLtm;
@@ -542,6 +630,88 @@ class MarketReader {
             // (On tick updates, this.atr stays stable from previous bar close.)
             const atr = Math.max(this.atr, this.atrFloor);
 
+            // ── DELTA BUBBLE DETECTION (per new bar) ─────────────────
+            // For each new bar, look at its volume profile and find the
+            // price level with the biggest |askVol - bidVol|. If above the
+            // threshold, record it. The history feeds entry confirmation
+            // and exit-hold logic. Wrapped in try/catch — d.profile() may
+            // be unavailable on chart types without per-price volume.
+            if(isNewBar && typeof d.profile === 'function'){
+                try {
+                    const _profs = d.profile();
+                    if(_profs && _profs.length > 0){
+                        const _bThr = (p.bubbleThreshold!=null?p.bubbleThreshold:120);
+                        const _ppb  = (p.bubblePriceLevels!=null?p.bubblePriceLevels:6);
+                        const _step = this.tickSize * _ppb;
+                        const _buckets = {};
+                        let _last = null, _barInit = null;
+                        const _sorted = _profs.slice().sort((a,b)=>a.price-b.price);
+                        for(const pr of _sorted){
+                            if(_barInit === null) _barInit = pr.price;
+                            if(_last !== null && _last >= _barInit + _step) _barInit = pr.price;
+                            const k = _barInit.toFixed(7);
+                            if(!_buckets[k]){
+                                _buckets[k] = { price:_barInit, askVol:0, bidVol:0 };
+                            }
+                            _buckets[k].askVol += (pr.askVol || 0);
+                            _buckets[k].bidVol += (pr.bidVol || 0);
+                            _last = pr.price;
+                        }
+                        // Find the largest absolute delta bucket.
+                        let _maxAbs = 0, _bub = null;
+                        for(const k in _buckets){
+                            const _bk = _buckets[k];
+                            const _d = _bk.askVol - _bk.bidVol;
+                            if(Math.abs(_d) > _maxAbs){
+                                _maxAbs = Math.abs(_d);
+                                _bub = { price:_bk.price, delta:_d };
+                            }
+                        }
+                        if(_bub && _maxAbs >= _bThr){
+                            this.bubbles.push({
+                                bar: bi,
+                                price: _bub.price,
+                                delta: _bub.delta,
+                                ts: ts.getTime(),
+                            });
+                            if(this.bubbles.length > 40) this.bubbles.shift();
+                            // EMA of |delta| over recent bubbles. Used by the
+                            // contra/hold filters to auto-scale thresholds
+                            // to this chart's typical bubble magnitude.
+                            const _alpha = 0.1;
+                            this.bubbleAvgAbs = this.bubbleAvgAbs > 0
+                                ? this.bubbleAvgAbs * (1 - _alpha) + _maxAbs * _alpha
+                                : _maxAbs;
+                        }
+                    }
+                } catch(e) { /* profile unavailable on this chart — skip */ }
+            }
+
+            // ── MARKET-STATE CLASSIFICATION (per new bar) ────────────
+            // Recompute the regime once per bar; cache on `this.marketState`.
+            // Used by the STATE-FAIL dynamic gate and surfaced in HUD.
+            if(isNewBar){
+                this.marketState = this._classifyMarketState(c, atr);
+                // Track which sigma levels actually get respected vs broken.
+                this._trackSigmaRespect(bi, h, l, c, atr);
+            }
+
+            // ── VOLATILITY-BY-HOUR PROFILE ───────────────────────────
+            // Bucket the bar's range into a 15-min bin. Over time the
+            // bins reveal the windows where the day's big moves usually
+            // happen (e.g. NY 09:45, 11:00). Surfaced in HUD as "HOT".
+            if(isNewBar && n > 1){
+                const _bm = Math.floor(bLtm/15)*15;
+                const _bin = (bLth<10?'0':'')+bLth+':'+(_bm<10?'0':'')+_bm;
+                if(!this.volBins[_bin]) this.volBins[_bin] = {n:0, sumRange:0};
+                const _b = this.volBins[_bin];
+                _b.n++; _b.sumRange += (h-l);
+                // Prevent unbounded growth — halve to preserve avg.
+                if(_b.n > 200){ _b.n = 100; _b.sumRange /= 2; }
+            }
+
+            // (IB tracking moved below to after sessSuffix is computed)
+
             // ── DETERMINISTIC AVGVOL SEEDING ─────────────────────────
             // Same: only push on new bars. Tick updates evolve the live
             // bar's vol but don't add a new entry to the rolling buffer.
@@ -585,9 +755,7 @@ class MarketReader {
             else if(isAsia   && tAsia)   sessSuffix='_asia';
             else if(isLondon && tLondon) sessSuffix='_london';
 
-            const dateStr = isLive
-                ? wcDateStr
-                : (lt.getUTCFullYear()+'-'+(lt.getUTCMonth()+1)+'-'+lt.getUTCDate());
+            const dateStr = lt.getUTCFullYear()+'-'+(lt.getUTCMonth()+1)+'-'+lt.getUTCDate();
             const newSessKey = dateStr+sessSuffix;
 
             const twoSuffix = isEve?'_eve':'_day';
@@ -609,6 +777,41 @@ class MarketReader {
             }
 
             if(isNewBar && newSessKey!==this.sessKey){
+                // ── H5: FORCE-FLAT AT SESSION BOUNDARY ──────────────────
+                // Never let a position ride into the next session while the
+                // daily risk counters reset under it. Close at this bar's
+                // market (close), realize P&L into the OUTGOING session, and
+                // record it BEFORE any reset below. (this.sessKey is still the
+                // outgoing session here, so the trade is journaled correctly.)
+                if(this.position !== 0){
+                    const _xPnl = (this.position===1 ? c - this.ep : this.ep - c);
+                    const _xWin = _xPnl > 0, _xQty = this.qty || 1;
+                    this.results.push({win:_xWin, pnl:_xPnl});
+                    if(this.results.length>5) this.results.shift();
+                    this.sessPnl  += _xPnl * _xQty;
+                    this.totalPnl += _xPnl * _xQty;
+                    if(_xWin) this.totalW++; else this.totalL++;
+                    if(_xWin) this.sessionWins++; else this.sessionLosses++;
+                    this._logJournal(bi, this.sessKey, hhmmStr, 'EXIT', {
+                        win:_xWin, pnl:Math.round(_xPnl*100)/100, reason:'SESSION-FLAT',
+                        entryBar:this.entryBar, ep:Math.round(this.ep*100)/100,
+                        ex:Math.round(c*100)/100, strength:this.lastStrengthScore,
+                        votesAgainst:this.lastThesisAgainst
+                    });
+                    if((this.props||{}).forwardLog){
+                        var _Rh = Math.abs(this.ep - this.sl) || 0;
+                        console.log('SDTRADE,'+ts.toISOString()+','+this.sessKey+','
+                            +(this.sigLevel||'')+','+(this.entrySource||'')+','
+                            +(this.entryState||'')+','+(this.position===1?'LONG':'SHORT')+','
+                            +this.ep.toFixed(2)+','+this.sl.toFixed(2)+','+this.tp2.toFixed(2)+','
+                            +c.toFixed(2)+',SESSION-FLAT,'
+                            +_xPnl.toFixed(2)+','+_Rh.toFixed(2)+','+this.barsHeld+','
+                            +(this.lastStrengthScore!=null?this.lastStrengthScore:'')+','
+                            +_xQty+','
+                            +((this.entryTs&&this.entryTs.toISOString)?this.entryTs.toISOString():''));
+                    }
+                    this.position=0; this.tp1Hit=false;
+                }
                 // Only carry forward H/L from REAL trading sessions.
                 // The _overnight buckets (4-6pm post-NY gap, 11pm-9:30am
                 // pre-NY gap) are brief dead-zones — letting their tiny
@@ -664,6 +867,10 @@ class MarketReader {
                 // 2026-04-30 → 2026-05-01 transition).
                 this.results=[];
                 this.pauseUntilBar=-1;
+                this.lastLossBar=-9999; this.lastLossDir=0; this.lastLossLevel='';
+                this.maxTradesOverrideUsed = false;
+                this.ibHigh = 0; this.ibLow = 0; this.ibStartBar = -1;
+                this.ibLocked = false; this.ibBroken = 0; this.ibBreakBars = 0;
                 // Reset cooldown so the open can fire immediately if
                 // a setup presents. barsSinceSig was probably mid-cooldown
                 // at session change — don't carry that into the new session.
@@ -701,6 +908,7 @@ class MarketReader {
                 this.volBuf=[];
                 this.avgVol=Math.max(vol, 1);
                 this._computeEXP(o);
+                this.sigmaRefreshDate = newSessKey;
 
                 this.pullbackToSigma=false; this.pullbackLevel=0; this.pullbackLevelType='';
                 this.trendDay=false; this.trendDayDir=0;
@@ -718,6 +926,55 @@ class MarketReader {
             } else if(isNewBar) {
                 if(h>this.sessHigh) this.sessHigh=h;
                 if(l<this.sessLow)  this.sessLow=l;
+                // Safety net: refresh sigma at every NY 9:30 AND EVE 18:00
+                // calendar-day open even if sessKey didn't transition.
+                // Catches the case where the wall-clock fallback masks
+                // session boundaries and sigma stays stuck on an old open.
+                const _isNYOpenBar  = (bLth === 9  && bLtm >= 30 && bLtm < 35);
+                const _isEVEOpenBar = (bLth === 18 && bLtm < 5);
+                const _refreshKey = _isNYOpenBar  ? dateStr+'_ny'
+                                  : _isEVEOpenBar ? dateStr+'_eve'
+                                  : '';
+                if(_refreshKey && this.sigmaRefreshDate !== _refreshKey){
+                    this.sigmaRefreshDate = _refreshKey;
+                    this.sessOpen = o;
+                    this.sessHigh = h; this.sessLow = l;
+                    this.sessOpenBar = bi;
+                    this._computeEXP(o);
+                }
+            }
+
+            // ── INITIAL BALANCE (NY first 60 min) ────────────────────
+            // The opening hour sets the day's character. A clean break
+            // and hold (3+ bars) of IB high or low marks a trend day,
+            // and counter-trend setups get blocked for the rest of the
+            // session via the IB-COUNTER filter. Cheap, fast, decisive
+            // — doesn't wait for swing-based mktState to catch up.
+            if(isNewBar && sessSuffix === '_ny'){
+                if(this.ibStartBar < 0){
+                    this.ibStartBar = bi;
+                    this.ibHigh = h; this.ibLow = l;
+                    this.ibLocked = false; this.ibBroken = 0; this.ibBreakBars = 0;
+                }
+                const _ibAge = bi - this.ibStartBar;
+                if(_ibAge <= 60){
+                    if(h > this.ibHigh) this.ibHigh = h;
+                    if(l < this.ibLow)  this.ibLow  = l;
+                } else {
+                    if(!this.ibLocked) this.ibLocked = true;
+                    if(this.ibBroken === 0){
+                        const _buf = atr * 0.3;
+                        if(c > this.ibHigh + _buf){
+                            this.ibBreakBars++;
+                            if(this.ibBreakBars >= 3) this.ibBroken = 1;
+                        } else if(c < this.ibLow - _buf){
+                            this.ibBreakBars++;
+                            if(this.ibBreakBars >= 3) this.ibBroken = -1;
+                        } else {
+                            this.ibBreakBars = 0;
+                        }
+                    }
+                }
             }
 
             // VWAP accumulates ONCE per bar (on isNewBar). Tick updates
@@ -731,13 +988,7 @@ class MarketReader {
             this.vwap   = this.vwapD>0 ? this.vwapN/this.vwapD : c;
 
             // Weekly key — wall-clock driven
-            let wkBase;
-            if(isLive){
-                const wcLocal = new Date(Date.now() + tz*3600000);
-                wkBase = {y:wcLocal.getUTCFullYear(), m:wcLocal.getUTCMonth()+1, d:wcLocal.getUTCDate()};
-            } else {
-                wkBase = {y:lt.getUTCFullYear(), m:lt.getUTCMonth()+1, d:lt.getUTCDate()};
-            }
+            const wkBase = {y:lt.getUTCFullYear(), m:lt.getUTCMonth()+1, d:lt.getUTCDate()};
             const wk = Math.ceil(wkBase.d/7);
             const weekKey = wkBase.y+'-'+wkBase.m+'-W'+wk;
             if(isNewBar && weekKey!==this.weekKey){
@@ -745,15 +996,14 @@ class MarketReader {
                     this.prevWeekHigh = this.weekHigh;
                     this.prevWeekLow  = this.weekLow;
                 }
-                this.weekKey=weekKey; this.weekHigh=h; this.weekLow=l; this.weekOpen=o;
+                this.weekKey=weekKey; this.weekHigh=h; this.weekLow=l; this.weekOpen=o; this.weekOpenBar=bi;
             } else if(isNewBar) {
                 if(h>this.weekHigh) this.weekHigh=h;
                 if(l<this.weekLow)  this.weekLow=l;
             }
-            // Monthly anchor + weekly/monthly expected-move bands (anchored at
-            // the week/month open; sized from the pasted straddle params).
+            // Monthly anchor + weekly/monthly expected-move bands (options-implied)
             const _monthKey = wkBase.y+'-'+wkBase.m;
-            if(isNewBar && _monthKey!==this.monthKey){ this.monthKey=_monthKey; this.monthOpen=o; }
+            if(isNewBar && _monthKey!==this.monthKey){ this.monthKey=_monthKey; this.monthOpen=o; this.monthOpenBar=bi; }
             const _emW=(p.expMoveWeekly!=null?p.expMoveWeekly:0)||0;
             const _emM=(p.expMoveMonthly!=null?p.expMoveMonthly:0)||0;
             this.wk1H=(this.weekOpen>0&&_emW>0)?this.weekOpen+_emW:0;
@@ -762,19 +1012,10 @@ class MarketReader {
             this.mo1L=(this.monthOpen>0&&_emM>0)?this.monthOpen-_emM:0;
 
             // ── DAILY CANDLE — futures-session boundary at 5 PM EDT ──
-            let fLth, fY, fM, fD;
-            if(isLive){
-                const wcLocal = new Date(Date.now() + tz*3600000);
-                fLth = wcLocal.getUTCHours();
-                fY = wcLocal.getUTCFullYear();
-                fM = wcLocal.getUTCMonth()+1;
-                fD = wcLocal.getUTCDate();
-            } else {
-                fLth = lth;
-                fY = lt.getUTCFullYear();
-                fM = lt.getUTCMonth()+1;
-                fD = lt.getUTCDate();
-            }
+            let fLth = lth;
+            let fY = lt.getUTCFullYear();
+            let fM = lt.getUTCMonth()+1;
+            let fD = lt.getUTCDate();
             if(fLth >= 17){
                 const dt = new Date(Date.UTC(fY, fM-1, fD+1));
                 fY = dt.getUTCFullYear();
@@ -1568,8 +1809,9 @@ class MarketReader {
                 balanceCol:  '#aa99cc',
                 mktBull:     '#00FFCC', mktBear:     '#FF6622', mktNeutral:'#FFFFFF',
             };
+            const showFallbackSigmas = (p.showFallbackSigmas != null ? p.showFallbackSigmas : 0) >= 1;
 
-            if(this.exp1H>0){
+            if(this.exp1H>0 && (this.expDailyIsInput || showFallbackSigmas)){
                 _ret.sessId   = this.sessKey;
                 _ret.expCurH  = this.exp1H;
                 _ret.expH=this.exp1H; _ret.expL=this.exp1L;
@@ -1580,6 +1822,63 @@ class MarketReader {
             }
             _ret.weekId=this.weekKey; _ret.wkH=this.wk1H; _ret.wkL=this.wk1L;
             _ret.monthId=this.monthKey; _ret.moH=this.mo1H; _ret.moL=this.mo1L;
+
+            // Draw expected-move bands as ordinary graphics on the latest
+            // bar only. Keeping this before the warmup/ready gate lets EM
+            // render while the signal engine warms up, without stacking one
+            // full band set for every historical bar.
+            const _drawEMFallback = typeof d.isLast==='function' && d.isLast();
+            const _emRight = this.lastChartIdx + 10;
+            const _emLeft = Math.max(0, this.lastChartIdx - 40);
+            const _emLabelX = op(du(this.lastChartIdx),'+',px(10));
+            const _emLine = (key, y, color, width, opacity, label) => {
+                if(!(y > 0)) return;
+                _items.push({tag:'LineSegments', key:key,
+                    lines:[{tag:'Line', a:{x:du(_emLeft), y:du(y)}, b:{x:du(_emRight), y:du(y)}}],
+                    lineStyle:{lineWidth:width, color:color, opacity:opacity}});
+                if(label){
+                    _items.push({tag:'Text', key:key+'_lbl', text:label+' '+y.toFixed(0),
+                        point:{x:_emLabelX, y:du(y)},
+                        style:{fontSize:_fz(10), fontWeight:'bold', fill:color},
+                        textAlignment:'leftMiddle', global:true});
+                }
+            };
+            // Live daily EM — read expMoveDaily every render and anchor at the
+            // session open, so the bands appear the instant you set the param
+            // (no dependency on the session-open recompute / stale flag).
+            const _emDLive = (this.props && this.props.expMoveDaily) || 0;
+            const _emAnchor = this.sessOpen > 0 ? this.sessOpen : c;
+            if(_drawEMFallback && _emDLive > 0){
+                _emLine('em_d_1h', _emAnchor+_emDLive*0.5, '#00CCFF', 2, 1.0, 'D +0.5EM');
+                _emLine('em_d_1l', _emAnchor-_emDLive*0.5, '#00CCFF', 2, 1.0, 'D -0.5EM');
+                _emLine('em_d_mid', _emAnchor, '#00FF88', 1, 0.35, 'D OPEN');
+                _emLine('em_d_2h', _emAnchor+_emDLive, '#FF8C00', 1, 0.85, 'D +1EM');
+                _emLine('em_d_2l', _emAnchor-_emDLive, '#FF8C00', 1, 0.85, 'D -1EM');
+                _emLine('em_d_3h', _emAnchor+_emDLive*1.5, '#FFEE00', 1, 0.75, 'D +1.5EM');
+                _emLine('em_d_3l', _emAnchor-_emDLive*1.5, '#FFEE00', 1, 0.75, 'D -1.5EM');
+                _emLine('em_d_4h', _emAnchor+_emDLive*2.0, '#FF2244', 2, 0.9, 'D +2EM');
+                _emLine('em_d_4l', _emAnchor-_emDLive*2.0, '#FF2244', 2, 0.9, 'D -2EM');
+            } else if(_drawEMFallback && this.exp1H>0 && showFallbackSigmas){
+                _emLine('em_d_1h', this.exp1H, '#00CCFF', 2, 1.0, 'D +0.5EM');
+                _emLine('em_d_1l', this.exp1L, '#00CCFF', 2, 1.0, 'D -0.5EM');
+                _emLine('em_d_2h', this.exp2H, '#FF8C00', 1, 0.85, 'D +1EM');
+                _emLine('em_d_2l', this.exp2L, '#FF8C00', 1, 0.85, 'D -1EM');
+            }
+            if(_drawEMFallback && this.wk1H>0){
+                _emLine('em_w_1h', this.wk1H, '#B388FF', 2, 0.8, 'WK +EM');
+                _emLine('em_w_1l', this.wk1L, '#B388FF', 2, 0.8, 'WK -EM');
+            }
+            if(_drawEMFallback && this.mo1H>0){
+                _emLine('em_m_1h', this.mo1H, '#FF88DD', 2, 0.7, 'MO +EM');
+                _emLine('em_m_1l', this.mo1L, '#FF88DD', 2, 0.7, 'MO -EM');
+            }
+            if(_drawEMFallback && _emDLive<=0 && this.wk1H<=0 && this.mo1H<=0){
+                _items.push({tag:'Text', key:'em_status_off',
+                    text:'EM OFF: set expMoveDaily / Weekly / Monthly > 0',
+                    point:{x:_emLabelX, y:du(c + atr*1.8)},
+                    style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FFCC44'},
+                    textAlignment:'leftMiddle', global:true});
+            }
 
             const readyTime = sessSuffix !== '_overnight' ||
                               (tNY && (bLth===9 || (bLth===8&&bLtm>=30)));
@@ -1750,7 +2049,7 @@ class MarketReader {
             // Only run on the live forward timeline — not on replay
             // passes. Otherwise SL/TP would falsely trigger when an old
             // bar is replayed that happens to touch our stop level.
-            let exitNow=false, exitPnl=0;
+            let exitNow=false, exitPnl=0, exitDir=0;
 
             // ════════════════════════════════════════════════════
             // RUN PATTERN HELPERS BEFORE POSITION MANAGEMENT
@@ -1931,6 +2230,24 @@ class MarketReader {
                         if(strengthScore >= 7)      trailDist = atr * 2.2;  // looser
                         else if(strengthScore <= 3) trailDist = atr * 0.9;  // tighter
                     }
+                    // Bubble-aware: a fresh bubble in trade direction means
+                    // the move still has aggressive participation — give it
+                    // more room to run. Bubble against = tighten and lock in.
+                    // Threshold = max(absFloor, avgBubble * 1.8) — auto-
+                    // scales per chart so NY (4096t) and EVE (3072t) both
+                    // get a meaningful "strong bubble" definition.
+                    const _bubX = this._recentBubbleAtZone(c, atr, 3, 2.0, bi);
+                    if(_bubX){
+                        const _bubXDir = _bubX.delta > 0 ? 1 : -1;
+                        const _holdMult  = (p.bubbleHoldMult!=null?p.bubbleHoldMult:1.8);
+                        const _holdFloor = (p.bubbleHoldFloor!=null?p.bubbleHoldFloor:250);
+                        const _strongHold = Math.max(_holdFloor, this.bubbleAvgAbs * _holdMult);
+                        if(_bubXDir === pos && Math.abs(_bubX.delta) > _strongHold){
+                            trailDist *= 1.5;  // hold the winner — flow agrees
+                        } else if(_bubXDir !== pos && Math.abs(_bubX.delta) > _strongHold){
+                            trailDist *= 0.6;  // flow flipped — tighten now
+                        }
+                    }
                     if(pos===1)  this.trailSL = Math.max(this.trailSL, c-trailDist);
                     if(pos===-1) this.trailSL = Math.min(this.trailSL, c+trailDist);
                 }
@@ -1940,27 +2257,90 @@ class MarketReader {
                     if(pos===-1 && c<=this.tp1){ this.tp1Hit=true; this.trailSL=c+atr*1.5; }
                 }
 
-                const hitTP2    = pos===1  ? c>=this.tp2  : c<=this.tp2;
+                // ── TP-VS-SL PROXIMITY + STALL DETECTION ─────────────
+                // Before TP1 hits, assess whether TP is more reachable than
+                // SL. If price has drifted closer to SL without momentum,
+                // tighten the SL adaptively. If trade has stalled 25+ bars
+                // with weak unrealized, exit at market — the move isn't
+                // coming, free the slot for a fresh setup.
+                let stallExit = false;
+                if(!this.tp1Hit && this.entryRisk > 0){
+                    const _unr = pos===1 ? c-this.ep : this.ep-c;
+                    const _distToTP = pos===1 ? (this.tp1 - c) : (c - this.tp1);
+                    const _distToSL = pos===1 ? (c - this.sl) : (this.sl - c);
+                    const _proximityToSL = _distToSL / Math.max(_distToSL + _distToTP, 0.01);
+                    // Stall: 25+ bars in, unrealized < 0.4R, momentum dying
+                    if(this.barsHeld >= 25 && Math.abs(_unr) < this.entryRisk * 0.4){
+                        // Check momentum dying: last 5 bars net move < 0.5 ATR
+                        if(n >= 6){
+                            const _recent = c - this.C[n - 6];
+                            if(Math.abs(_recent) < atr * 0.5){
+                                stallExit = true;
+                            }
+                        }
+                    }
+                    // Closer to SL than TP + against-direction momentum =
+                    // tighten SL to lock in any remaining value
+                    if(_proximityToSL < 0.35 && _unr < 0){
+                        // We've drifted way toward SL — pull SL halfway
+                        // closer to entry to cap loss
+                        const _newSL = pos===1
+                            ? this.sl + (this.ep - this.sl) * 0.3
+                            : this.sl - (this.sl - this.ep) * 0.3;
+                        if(pos===1)  this.sl = Math.max(this.sl, _newSL);
+                        if(pos===-1) this.sl = Math.min(this.sl, _newSL);
+                    }
+                }
+
+                // Stops/targets are resting orders → trigger on the bar's
+                // EXTREME (intrabar), not the close. A wick through the stop
+                // is a fill even if the bar closes back the other side.
+                const hitTP2    = pos===1  ? h>=this.tp2  : l<=this.tp2;
                 const hitSL     = pos===1  ? l<=this.sl   : h>=this.sl;
-                const hitTrail  = this.tp1Hit && (pos===1 ? c<=this.trailSL : c>=this.trailSL);
+                const hitTrail  = this.tp1Hit && (pos===1 ? l<=this.trailSL : h>=this.trailSL);
                 const maxHit    = this.barsHeld >= MAX_HOLD;
                 // EOD risk close — force exit at session end regardless of
                 // P&L. Better to take whatever you have than hold through
                 // the boundary into low liquidity / settlement gap.
                 const eodExit   = sessionEndExit;
 
-                if(hitTP2||hitSL||hitTrail||maxHit||eodExit||peakGiveBackExit||thesisBrokenExit||wyckoffEventExit){
+                if(hitTP2||hitSL||hitTrail||maxHit||eodExit||peakGiveBackExit||thesisBrokenExit||wyckoffEventExit||stallExit){
                     exitNow=true;
-                    exitPnl = pos===1 ? c-this.ep : this.ep-c;
+                    exitDir=pos;
+                    // Book P&L at the price that ACTUALLY fired, not the close.
+                    // Straddle priority: stop/trail before target (assume the
+                    // adverse level filled first — conservative without tick data).
+                    let fillPx;
+                    if(hitSL)         fillPx = this.sl;
+                    else if(hitTrail) fillPx = this.trailSL;
+                    else if(hitTP2)   fillPx = this.tp2;
+                    else              fillPx = c;   // maxHold/EOD/give-back/stall/thesis = market @ close
+                    exitPnl = pos===1 ? fillPx - this.ep : this.ep - fillPx;
 
-                    const win = exitPnl >= 0;
+                    const win = exitPnl > 0;   // breakeven (scratch) is NOT a win
                     this.results.push({win, pnl:exitPnl});
                     if(this.results.length>5) this.results.shift();
-                    this.sessPnl  += exitPnl;
-                    this.totalPnl += exitPnl;
+                    this.sessPnl  += exitPnl * this.qty;   // qty-weighted → sessPnl*cv = real account $
+                    this.totalPnl += exitPnl * this.qty;
                     if(win) this.totalW++; else this.totalL++;
 
                     const baseBhv = (this.sigBehavior||'').split('@')[0];
+                    // Per-(state, level-type) stats — bucket the outcome by
+                    // market state at entry AND the level type that triggered
+                    // it (MTT_H, SWICK_INV, etc). The dynamic gate looks up
+                    // these stats at decision time to refuse setups that have
+                    // historically lost in the current state.
+                    const _eState = this.entryState || 'NEUTRAL';
+                    const _eLevel = this.sigLevel || '';
+                    if(_eLevel){
+                        if(!this.stateStats[_eState]) this.stateStats[_eState] = {};
+                        if(!this.stateStats[_eState][_eLevel]){
+                            this.stateStats[_eState][_eLevel] = {w:0, l:0, pnl:0};
+                        }
+                        const _ss = this.stateStats[_eState][_eLevel];
+                        if(win) _ss.w++; else _ss.l++;
+                        _ss.pnl += exitPnl;
+                    }
                     if(this.behaviorStats[baseBhv]){
                         const s = this.behaviorStats[baseBhv];
                         if(win) s.w++; else s.l++;
@@ -1973,7 +2353,18 @@ class MarketReader {
                     }
 
                     const losses = this.results.filter(r=>!r.win).length;
-                    if(losses>=3) this.pauseUntilBar = bi + PAUSE_BARS;
+                    // 2 losses in last 5 trades = pause. Was 3, but today's
+                    // session lost 4 in a row before pause kicked. When the
+                    // system is wrong about regime, give it a forced timeout
+                    // earlier so it can re-evaluate.
+                    if(losses>=2) this.pauseUntilBar = bi + PAUSE_BARS;
+                    // Track the failing setup so we don't re-fire the same
+                    // direction at the same level type immediately after.
+                    if(!win){
+                        this.lastLossBar = bi;
+                        this.lastLossDir = pos;
+                        this.lastLossLevel = this.sigLevel || '';
+                    }
 
                     if(this.renderMap[this.entryBar]){
                         this.renderMap[this.entryBar].exitPnl = exitPnl;
@@ -1993,6 +2384,7 @@ class MarketReader {
                             jEntry.exitReason = hitTP2 ? 'TP2' :
                                                 hitSL ? 'SL' :
                                                 hitTrail ? 'TRAIL' :
+                                                stallExit ? 'STALL' :
                                                 wyckoffEventExit ? wyckoffEventReason :
                                                 thesisBrokenExit ? 'THESIS-BROKEN' :
                                                 peakGiveBackExit ? 'GIVE-BACK' :
@@ -2004,13 +2396,31 @@ class MarketReader {
                     this._logJournal(bi, this.sessKey, hhmmStr, 'EXIT', {
                         win: win,
                         pnl: Math.round(exitPnl*100)/100,
-                        reason: hitTP2?'TP2':hitSL?'SL':hitTrail?'TRAIL':wyckoffEventExit?wyckoffEventReason:thesisBrokenExit?'THESIS-BROKEN':peakGiveBackExit?'GIVE-BACK':eodExit?'EOD':'MAX-HOLD',
+                        reason: hitTP2?'TP2':hitSL?'SL':hitTrail?'TRAIL':stallExit?'STALL':wyckoffEventExit?wyckoffEventReason:thesisBrokenExit?'THESIS-BROKEN':peakGiveBackExit?'GIVE-BACK':eodExit?'EOD':'MAX-HOLD',
                         entryBar: this.entryBar,
                         ep: Math.round(this.ep*100)/100,
                         ex: Math.round(c*100)/100,
                         strength: this.lastStrengthScore,
                         votesAgainst: this.lastThesisAgainst
                     });
+                    // ── FORWARD-TEST TRADE LOG (pairs with the honest-fill patch) ──
+                    // One durable, machine-readable line per closed trade. Copy
+                    // 'SDTRADE,' lines from the browser console into a file, then:
+                    //   node tests/forward_report.js <file>
+                    if((this.props||{}).forwardLog){
+                        var _fx = (typeof fillPx !== 'undefined') ? fillPx : c;
+                        var _Rr = Math.abs(this.ep - this.sl) || 0;
+                        console.log('SDTRADE,'+ts.toISOString()+','+this.sessKey+','
+                            +(this.sigLevel||'')+','+(this.entrySource||'')+','
+                            +(this.entryState||'')+','+(pos===1?'LONG':'SHORT')+','
+                            +this.ep.toFixed(2)+','+this.sl.toFixed(2)+','+this.tp2.toFixed(2)+','
+                            +_fx.toFixed(2)+','
+                            +(hitTP2?'TP2':hitSL?'SL':hitTrail?'TRAIL':stallExit?'STALL':eodExit?'EOD':maxHit?'MAX-HOLD':'EXIT')+','
+                            +exitPnl.toFixed(2)+','+_Rr.toFixed(2)+','+this.barsHeld+','
+                            +(this.lastStrengthScore!=null?this.lastStrengthScore:'')+','
+                            +(this.qty||1)+','
+                            +((this.entryTs&&this.entryTs.toISOString)?this.entryTs.toISOString():''));
+                    }
                     if(win) this.sessionWins++; else this.sessionLosses++;
                     this.position=0; this.tp1Hit=false;
                 }
@@ -2334,24 +2744,117 @@ class MarketReader {
             // ─────────────────────────────────────────────────────────
             // SIGNAL GENERATION
             // ─────────────────────────────────────────────────────────
+            // ── DAY-QUALITY composite (0-10) ─────────────────────────
+            // Aggregates the regime signals the indicator is reading
+            // into a single number. Used as a master gate: when the
+            // day looks structurally hostile to mean-reversion (low
+            // quality), refuse all setups regardless of setup score.
+            // Also surfaced in HUD so the user can see WHY trades are
+            // being held back.
+            let dayQuality = 5;            // neutral
+            const _dqReasons = [];
+            // IB unbroken + held → +2 (balance day character)
+            if(this.ibLocked && this.ibBroken === 0){
+                dayQuality += 2; _dqReasons.push('IB-HELD');
+            }
+            // IB broken → -3 (trend day character, mean-reversion fragile)
+            if(this.ibBroken !== 0){
+                dayQuality -= 3; _dqReasons.push('IB-BROKEN');
+            }
+            // Strong directional day move (>5 ATR) → -2
+            if(this.sessOpen > 0){
+                const _dMv  = Math.abs(c - this.sessOpen);
+                if(_dMv > atr * 5){
+                    dayQuality -= 2; _dqReasons.push('DAY-DIRECTIONAL');
+                }
+            }
+            // PIDR in extreme zone (<15% or >85%) → -1
+            if(this.sessOpen > 0){
+                const _pidr = (c - this.sessLow) /
+                    Math.max(this.sessHigh - this.sessLow, 0.01);
+                if(_pidr < 0.15 || _pidr > 0.85){
+                    dayQuality -= 1; _dqReasons.push('PIDR-EXTREME');
+                }
+            }
+            // H1 trending → -1 (mean-reversion fights HTF)
+            if(this.h1Trend === 'BULL' || this.h1Trend === 'BEAR'){
+                dayQuality -= 1; _dqReasons.push('H1-TRENDING');
+            }
+            // Recent loss streak → -2 (something is structurally off)
+            if(this.results && this.results.length >= 2){
+                const _recentL = this.results.slice(-2).filter(r=>!r.win).length;
+                if(_recentL >= 2){ dayQuality -= 2; _dqReasons.push('LOSS-STREAK'); }
+            }
+            // Low recent momentum (last 20 bars net move < 1.5 ATR) → +1
+            // This keeps balance/chop days firmly above the master block
+            // threshold so genuine fade setups can fire.
+            if(n >= 21){
+                const _refC = this.C[n - 21];
+                if(_refC != null && Math.abs(c - _refC) < atr * 1.5){
+                    dayQuality += 1; _dqReasons.push('LOW-MOMENTUM');
+                }
+            }
+            // Floor + ceiling
+            dayQuality = Math.max(0, Math.min(10, dayQuality));
+            this.dayQuality = dayQuality;
+            this.dayQualityReasons = _dqReasons;
+
+            // ── HARD-STOP: half-loss kill switch ─────────────────────
+            // If session P&L drops below half of maxDailyLoss, refuse
+            // any further trades. Better to take a small loss day than
+            // give the system rope to hang itself with revenge trades.
+            const _halfLossHit = this.sessPnl * cv <= -(maxLoss * 0.5)
+                                  && this.dailyTrades > 0;
+
+            // ── COIL BREAKOUT detection (new entry signal class) ──
+            // Measured edge: 4:1 favorable/adverse over 20 bars across
+            // 3.5 years of QQQ data. Direction = breakout bar's direction.
+            // Fires as its own signal class — bypasses the NO-LEVEL guard
+            // (the coil IS the level) but still respects regime/quality
+            // filters downstream.
+            let coilFire = 0;
+            if(isNewBar && (bi - this.lastCoilBreakBar) > 10){
+                const _coil = this._detectCoil(bi, atr, 6);
+                if(_coil){
+                    coilFire = this._coilBreakDir(_coil, c, o, h, l, atr);
+                    if(coilFire !== 0) this.lastCoilBreakBar = bi;
+                }
+            }
+
             let blockReason = '';
+            // ── BLOCK PRECEDENCE (most punitive wins) ───────────────────
+            // Structural first, then HARD account-survival + PACING blocks,
+            // THEN the overridable MAX-TRADES, then setup-quality. HARD/PACING
+            // MUST sit above MAX-TRADES: the flip-override (below) may only
+            // relax MAX-TRADES, and it is reached only when canTrade is true.
+            // If MAX-TRADES could mask MAX-LOSS/HARD-STOP/LOSS-PAUSE, the
+            // override would silently bypass the daily loss cap.
             if(!timeOK)                                blockReason='TIME';
             else if(this.position!==0)                 blockReason='IN-POS';
             else if(sessionEndBlock)                   blockReason='EOD-BLOCK';
-            else if(this.dailyTrades>=maxTrades)       blockReason='MAX-TRADES';
+            else if(n < WARM_BARS)                     blockReason='WARM-UP';
+            else if(this.sessPnl*cv<=-maxLoss)         blockReason='MAX-LOSS';
+            else if(_halfLossHit)                      blockReason='HARD-STOP';
             else if(bi<=this.pauseUntilBar)            blockReason='LOSS-PAUSE';
             else if(this.barsSinceSig<=5)              blockReason='COOLDOWN';
-            else if(this.sessPnl*cv<=-maxLoss)         blockReason='MAX-LOSS';
-            else if(!(atLevel||isSweepEntry))          blockReason='NO-LEVEL';
+            else if(this.dailyTrades>=maxTrades)       blockReason='MAX-TRADES';
+            else if(dayQuality < 4)                    blockReason='DAY-QUALITY';
+            else if(!(atLevel||isSweepEntry||coilFire!==0)) blockReason='NO-LEVEL';
             this.blockReason = blockReason;
-            const canTrade = blockReason === '';
+            // Allow decision eval to proceed when the only block is MAX-TRADES
+            // and the regime-flip override hasn't been used yet — the actual
+            // override decision (opposite dir + score≥7) is applied after the
+            // decision is computed and the proposed direction is known.
+            const onlyMaxTrades = (blockReason === 'MAX-TRADES') && !this.maxTradesOverrideUsed;
+            const canTrade = blockReason === '' || onlyMaxTrades;
 
             // ── DIAGNOSTICS: log this bar's signal-attempt outcome ──
             // Every bar where we actively considered a trade (i.e., not
             // blocked by structural reasons like TIME or IN-POS) gets
             // logged. This builds the "why didn't I take that?" trail.
             const structuralBlock = blockReason==='TIME' || blockReason==='IN-POS' ||
-                                    blockReason==='EOD-BLOCK' ||
+                                    blockReason==='EOD-BLOCK' || blockReason==='WARM-UP' ||
+                                    blockReason==='HARD-STOP' ||
                                     blockReason==='MAX-TRADES' || blockReason==='LOSS-PAUSE' ||
                                     blockReason==='COOLDOWN' || blockReason==='MAX-LOSS';
             if(!structuralBlock){
@@ -2451,6 +2954,19 @@ class MarketReader {
                 const structR   = this._readStructure(c, h, l, atr);
                 const flowR     = this._readOrderflow(c, h, l, o, vol, delta, atr, avgVol, n);
                 const decision  = this._combineReadings(auctionR, structR, flowR, nearLevel, atLevel);
+                // COIL injection: if a coil breakout fired this bar and the
+                // frameworks haven't already produced a fire signal, inject
+                // the coil as the decision. Direction = the breakout bar's
+                // direction. Score 7 puts it firmly in fireable territory
+                // but still requires downstream filters (regime, momentum,
+                // bubble-contra) to pass — so a coil on a hostile day still
+                // gets blocked appropriately.
+                if(coilFire !== 0 && !decision.fire){
+                    decision.fire = true;
+                    decision.dir = coilFire;
+                    decision.totalScore = 7;
+                    decision.setupTag = 'COIL@BREAK_' + (coilFire === 1 ? 'UP' : 'DN');
+                }
                 // Diagnostic — capture the readings on this bar even if no fire
                 if(this.signalAttempts.length > 0){
                     const sa = this.signalAttempts[this.signalAttempts.length-1];
@@ -2477,6 +2993,200 @@ class MarketReader {
                 }
                 if(decision.fire){
                     const dir = decision.dir;
+                    // Repeat-failed-setup guard: same dir + same level type
+                    // within REPEAT_LOSS_BARS of a loss = skip. Stops the
+                    // "buy every dip into a level that just stopped me out"
+                    // pattern when a level keeps rejecting in one direction.
+                    const _lt2pre = coilFire !== 0
+                        ? ('COIL_' + (coilFire === 1 ? 'UP' : 'DN'))
+                        : (nearLevel ? nearLevel.type : '');
+                    if(this.lastLossDir === dir &&
+                       this.lastLossLevel && this.lastLossLevel === _lt2pre &&
+                       (bi - this.lastLossBar) < REPEAT_LOSS_BARS){
+                        decision.fire = false;
+                        this.blockReason = 'REPEAT-LOSS';
+                    }
+                    // Chase filter: block entries at the wrong end of a fresh
+                    // extended move. A SHORT near the bottom of a >6 ATR
+                    // 15-bar range, or a LONG near the top, means the move
+                    // already happened — you're paying premium for what's
+                    // already paid out. Today's 11:15 SHORT @ 27738 fired
+                    // after a 200pt drop and immediately reversed; this
+                    // would have caught it.
+                    if(decision.fire){
+                        const _chaseLB = 15;
+                        let _hi = h, _lo = l;
+                        for(let i = 1; i <= _chaseLB && (n-1-i) >= 0; i++){
+                            const _hi_i = this.H[n-1-i], _lo_i = this.L[n-1-i];
+                            if(_hi_i > _hi) _hi = _hi_i;
+                            if(_lo_i < _lo) _lo = _lo_i;
+                        }
+                        const _rng = _hi - _lo;
+                        if(_rng > atr * 6){
+                            const _posInRng = (c - _lo) / Math.max(_rng, 0.01);
+                            if(dir === -1 && _posInRng < 0.30){
+                                decision.fire = false;
+                                this.blockReason = 'CHASE-DOWN';
+                            } else if(dir === 1 && _posInRng > 0.70){
+                                decision.fire = false;
+                                this.blockReason = 'CHASE-UP';
+                            }
+                        }
+                    }
+                    // IB-COUNTER: once NY's initial balance is broken and
+                    // held, treat it as a trend day in that direction.
+                    // Counter-trend setups get blocked outright for the
+                    // rest of the session — no waiting on mktState.
+                    if(decision.fire && this.ibBroken !== 0 && dir === -this.ibBroken){
+                        decision.fire = false;
+                        this.blockReason = 'IB-COUNTER';
+                    }
+                    // H1-COUNTER: when the higher timeframe (H1) is clearly
+                    // trending, counter-trend trades require a much higher
+                    // score. AUCT/STR/FLOW only see ~20 1-min bars; this
+                    // adds the macro view they're missing.
+                    if(decision.fire && this.h1Trend && this.h1Trend !== 'FLAT'){
+                        const _h1Dir = this.h1Trend === 'BULL' ? 1 : -1;
+                        if(dir === -_h1Dir && (decision.totalScore || 0) < 7){
+                            decision.fire = false;
+                            this.blockReason = 'H1-COUNTER';
+                        }
+                    }
+                    // BUBBLE-CONTRA: refuse entry when a strong OPPOSITE-
+                    // direction delta bubble printed at this level in the
+                    // last 5 bars. Means the wrong side is aggressively
+                    // hitting it — your level isn't holding.
+                    // Threshold = max(absoluteFloor, avgBubble * 1.5) — auto-
+                    // scales to each chart's own bubble activity.
+                    if(decision.fire){
+                        const _bub = this._recentBubbleAtZone(c, atr, 5, 1.0, bi);
+                        if(_bub){
+                            const _bubDir = _bub.delta > 0 ? 1 : -1;
+                            const _contraMult = (p.bubbleContraMult!=null?p.bubbleContraMult:1.5);
+                            const _floor = (p.bubbleContraFloor!=null?p.bubbleContraFloor:200);
+                            const _strongTh = Math.max(_floor, this.bubbleAvgAbs * _contraMult);
+                            if(dir !== _bubDir && Math.abs(_bub.delta) > _strongTh){
+                                decision.fire = false;
+                                this.blockReason = 'BUBBLE-CONTRA';
+                            }
+                        }
+                    }
+                    // STATE-FAIL: dynamic gate from per-state historical stats.
+                    // Refuses setups that have historically lost in the
+                    // current regime. Two block conditions:
+                    //   - <40% WR over ≥5 samples (clear coinflip-or-worse)
+                    //   - Negative cumulative P&L over ≥10 samples
+                    //     (wins are 50%+ but R:R is bad — backtest showed
+                    //     RANGE×MTT_L was 47% WR but -14.5pt total)
+                    // The PnL gate catches the trickier loser bucket the
+                    // WR gate misses.
+                    if(decision.fire && _lt2pre){
+                        const _wr = this._stateSetupWR(this.marketState, _lt2pre);
+                        // N2: gate only on NEGATIVE EXPECTANCY with an adequate
+                        // sample (≥20, enforced in _stateSetupWR). The old
+                        // win-rate<40% clause was dropped — it fought the
+                        // strategy's own low-win-rate / high-R:R design.
+                        if(_wr && _wr.pnl < 0){
+                            decision.fire = false;
+                            this.blockReason = 'STATE-FAIL';
+                        }
+                    }
+                    // MOMENTUM filter: catches what COUNTER-DAY misses early.
+                    // A 6+ ATR drop over 30 bars before the day's "directional"
+                    // threshold trips would still let a counter-trend long
+                    // slip through. This filter looks at the last 20 bars and
+                    // requires BOTH magnitude (net move > 3.5 ATR) AND
+                    // consistency (12+ of 20 bars closed in the move's
+                    // direction). Then refuses any trade against that flow.
+                    if(decision.fire && n >= 21){
+                        const _refClose = this.C[n - 21];
+                        const _netMv = c - _refClose;
+                        let _aligned = 0;
+                        for(let _i = 1; _i <= 20; _i++){
+                            const _o_i = this.O[n - 1 - _i];
+                            const _c_i = this.C[n - 1 - _i];
+                            if(_o_i == null || _c_i == null) continue;
+                            if(_netMv > 0 && _c_i > _o_i) _aligned++;
+                            else if(_netMv < 0 && _c_i < _o_i) _aligned++;
+                        }
+                        const _strong = Math.abs(_netMv) > atr * 3.5;
+                        const _consistent = _aligned >= 12;
+                        if(_strong && _consistent){
+                            const _momDir = _netMv > 0 ? 1 : -1;
+                            if(dir === -_momDir){
+                                decision.fire = false;
+                                this.blockReason = _momDir === -1
+                                    ? 'MOMENTUM-DOWN'
+                                    : 'MOMENTUM-UP';
+                            }
+                        }
+                    }
+                    // Day-context filters: the 15-bar chase filter only sees
+                    // recent action. A balance-then-dump day (today: 27945
+                    // top → 27620 = 320pt one-sided) leaves a small recent
+                    // range at the bottom while the DAY has clearly trended.
+                    // Use sessOpen/sessHigh/sessLow to gauge the whole day.
+                    if(decision.fire && this.sessOpen > 0){
+                        const _dayRng = Math.max(this.sessHigh - this.sessLow, 0.01);
+                        const _dayMv  = c - this.sessOpen;
+                        const _PIDR   = (c - this.sessLow) / _dayRng; // 0=low, 1=high
+                        const _dayDir = _dayMv > 0 ? 1 : -1;
+                        const _directional = Math.abs(_dayMv) > atr * 4;
+                        if(_directional){
+                            // COUNTER-DAY: fading a directional day at the
+                            // wrong extreme = catching falling knife.
+                            //   LONG when day is down AND price near day low
+                            //   SHORT when day is up AND price near day high
+                            if(dir === 1 && _dayDir === -1 && _PIDR < 0.35){
+                                decision.fire = false;
+                                this.blockReason = 'COUNTER-DAY';
+                            } else if(dir === -1 && _dayDir === 1 && _PIDR > 0.65){
+                                decision.fire = false;
+                                this.blockReason = 'COUNTER-DAY';
+                            }
+                            // LATE-CHASE: piling in WITH a directional day at
+                            // its extreme — the move already paid out.
+                            //   SHORT into the lows of a down day
+                            //   LONG into the highs of an up day
+                            if(decision.fire){
+                                if(dir === -1 && _dayDir === -1 && _PIDR < 0.20){
+                                    decision.fire = false;
+                                    this.blockReason = 'LATE-CHASE';
+                                } else if(dir === 1 && _dayDir === 1 && _PIDR > 0.80){
+                                    decision.fire = false;
+                                    this.blockReason = 'LATE-CHASE';
+                                }
+                            }
+                        }
+                    }
+                    // Regime-flip override: when at MAX-TRADES, allow ONE extra
+                    // trade if it's the opposite direction of recent losses and
+                    // high-conviction. The market just flipped on us — taking
+                    // the new direction is the whole point. Bounded to one use
+                    // per session.
+                    if(decision.fire && this.dailyTrades >= maxTrades){
+                        // The override may relax MAX-TRADES ONLY. Never let a
+                        // regime-flip reopen trading past the daily loss cap,
+                        // the hard-stop, or an active loss-pause. (Redundant
+                        // with block precedence above, kept as a hard guard.)
+                        const _overLoss  = this.sessPnl*cv <= -(maxLoss*0.5); // covers MAX-LOSS + HARD-STOP
+                        const _inPause   = bi <= this.pauseUntilBar;
+                        const isFlip = this.lastLossDir !== 0 &&
+                                       dir === -this.lastLossDir &&
+                                       decision.totalScore >= 7 &&
+                                       !this.maxTradesOverrideUsed &&
+                                       !_overLoss && !_inPause;
+                        if(isFlip){
+                            this.maxTradesOverrideUsed = true;
+                            this.blockReason = '';
+                        } else {
+                            decision.fire = false;
+                            this.blockReason = 'MAX-TRADES';
+                        }
+                    }
+                }
+                if(decision.fire){
+                    const dir = decision.dir;
                     const rsk = atr * 2.0;
                     let tps = this._findTPs(dir, c, levels, atr);
                     if(this.trendDay){
@@ -2484,7 +3194,9 @@ class MarketReader {
                         else        { tps[0]=this.exp2L||tps[0]; tps[1]=this.exp3L||tps[1]; }
                     }
                     // Source attribution — for the existing attrStats system.
-                    const lt2 = nearLevel ? nearLevel.type : '';
+                    const lt2 = coilFire !== 0
+                        ? ('COIL_' + (coilFire === 1 ? 'UP' : 'DN'))
+                        : (nearLevel ? nearLevel.type : '');
                     if(lt2==='BWALL'||lt2==='SWALL') this.entrySource='walls';
                     else if(lt2==='BFOOT'||lt2==='SFOOT') this.entrySource='footprint';
                     else this.entrySource='base';
@@ -2509,6 +3221,9 @@ class MarketReader {
                     this.sigBehavior = behaviorTag;
                     this.sigLevel    = lt2;
                     this.entryBar    = bi;
+                    // Snapshot the market state at entry so we can attribute
+                    // the outcome to the regime when the trade closes.
+                    this.entryState  = this.marketState || 'NEUTRAL';
                     // Also store the CHART bar index that Tradovate uses
                     // for x-coordinate rendering. this.entryBar is our
                     // internal index (this.barIdx); this.entryChartIdx is
@@ -2516,19 +3231,55 @@ class MarketReader {
                     // These are usually the same but can diverge across
                     // re-renders / replays / chart refreshes.
                     this.entryChartIdx = this.lastChartIdx;
+                    this.entryTs       = ts;   // backtest: enables IS/OOS split by ENTRY time
                     this.barsHeld    = 0;
                     this.barsSinceSig= 0;
                     this.dailyTrades++;
+                    // High-conviction setups get an extended TP2. When the
+                    // backtest measured edge to be top-quartile (score ≥7,
+                    // or a COIL fire which has measured +6pt/trade), push
+                    // TP2 from 2.5R to 3.5R to capture the full move.
+                    // Average winner of 1.34pt was 1:1 with avgL; widening
+                    // TP shifts R:R toward 1.7:1 on the trades that earn it.
+                    const _highConv = (decision.totalScore || 0) >= 7 || coilFire !== 0;
+                    const _tp2Mult = _highConv ? 3.5 : 2.5;
+                    // N4: cap stop distance. A level-anchored stop can land up to
+                    // ~3.3 ATR away (atLevel ≤2.5 ATR + 0.8 buffer); bound it so a
+                    // single trade's risk can't balloon (the H4 qty floor of 1
+                    // means a very wide stop still risks the full |entry-stop|).
+                    // Minimum stop stays ≥ rsk via the Math.min/Math.max below.
+                    const _maxStop = atr * ((p.maxStopAtr!=null && p.maxStopAtr>0) ? p.maxStopAtr : 3.0);
                     if(dir===1){
                         this.sl  = nearLevel ? Math.min(nearLevel.price-atr*0.8, c-rsk) : c-rsk;
+                        this.sl  = Math.max(this.sl, c - _maxStop);   // N4: clamp wide stops
                         this.tp1 = tps[0]||c+rsk*1.5;
-                        this.tp2 = tps[1]||c+rsk*2.5;
+                        this.tp2 = tps[1]||c+rsk*_tp2Mult;
                         newLong=true;
                     } else {
                         this.sl  = nearLevel ? Math.max(nearLevel.price+atr*0.8, c+rsk) : c+rsk;
+                        this.sl  = Math.min(this.sl, c + _maxStop);   // N4: clamp wide stops
                         this.tp1 = tps[0]||c-rsk*1.5;
-                        this.tp2 = tps[1]||c-rsk*2.5;
+                        this.tp2 = tps[1]||c-rsk*_tp2Mult;
                         newShort=true;
+                    }
+                    // N5: ensure TP1 (partial / trail-activation) is the NEARER
+                    // target and TP2 the farther one, even when one is a level and
+                    // the other a fallback — otherwise a far level-based TP1 with a
+                    // closer fallback TP2 would exit fully before the trail engages.
+                    if((dir===1 && this.tp1 > this.tp2) || (dir===-1 && this.tp1 < this.tp2)){
+                        const _tpSwap = this.tp1; this.tp1 = this.tp2; this.tp2 = _tpSwap;
+                    }
+                    // ── RISK-BASED POSITION SIZING (H4) ──────────────────
+                    // qty from the per-trade $ budget and the ACTUAL stop
+                    // distance, so the dollar guardrails (MAX-LOSS/HARD-STOP)
+                    // reflect what you really risk. Floored at 1 (signals are
+                    // never silently dropped) and capped by maxContracts.
+                    const _riskPerContract = Math.abs(this.ep - this.sl) * cv;
+                    if(riskPerTrade > 0 && _riskPerContract > 0){
+                        this.qty = Math.max(1, Math.min(maxContracts,
+                                              Math.floor(riskPerTrade / _riskPerContract)));
+                    } else {
+                        this.qty = 1;
                     }
                     this.renderMap[bi]={
                         dir, ep:c, sl:this.sl, tp1:this.tp1, tp2:this.tp2,
@@ -2783,9 +3534,12 @@ class MarketReader {
                 // Tradovate dedups by key, so a stable key per trade
                 // produces a single label even if map() re-fires.
                 const _exKey = 'ex_'+(this.entryBar||0)+'_'+bi;
+                // Place above bar when LONG-win or SHORT-loss (price went up at exit),
+                // below bar when LONG-loss or SHORT-win (price went down at exit).
+                const _above = (exitDir===1) === win;
                 _items.push({tag:'Text',key:_exKey,
                     text:win?'✓ WIN':'✗ LOSS',
-                    point:{x:du(this.lastChartIdx),y:du(win?h+atr:l-atr)},
+                    point:{x:du(this.lastChartIdx),y:du(_above?h+atr:l-atr)},
                     style:{fontSize:_fz(11),fontWeight:'bold',fill:win?_C.winText:_C.lossText},
                     textAlignment:'centerMiddle'});
             }
@@ -2799,6 +3553,44 @@ class MarketReader {
             const isLast = typeof d.isLast==='function' && d.isLast();
             if(isLast){
                 const _px = op(du(this.lastChartIdx),'+',px(8));
+
+                // Expected-move line fallback. The custom expPlotter draws
+                // these from history, but some Tradovate layouts do not call
+                // custom plotters reliably. Ordinary LineSegments keep the EM
+                // bands visible either way.
+                const _lineRight = this.lastChartIdx + 15;
+                const _lineFromBar = (bar, fallbackBars) => {
+                    const age = Math.max(0, bi - (bar || bi));
+                    return Math.max(0, this.lastChartIdx - (age || fallbackBars || 0));
+                };
+                const _pushLvlLine = (key, y, color, width, opacity, startX) => {
+                    if(!(y > 0)) return;
+                    _items.push({tag:'LineSegments', key:key,
+                        lines:[{tag:'Line', a:{x:du(startX), y:du(y)}, b:{x:du(_lineRight), y:du(y)}}],
+                        lineStyle:{lineWidth:width, color:color, opacity:opacity}});
+                };
+                if(false && this.exp1H>0){
+                    const sxExp = _lineFromBar(this.sessOpenBar, Math.min(bi, 80));
+                    _pushLvlLine('em_d_1h', this.exp1H, '#00CCFF', 2, 1.0, sxExp);
+                    _pushLvlLine('em_d_1l', this.exp1L, '#00CCFF', 2, 1.0, sxExp);
+                    _pushLvlLine('em_d_mid', this.expMid, '#00FF88', 1, 0.35, sxExp);
+                    _pushLvlLine('em_d_2h', this.exp2H, '#FF8C00', 1, 0.85, sxExp);
+                    _pushLvlLine('em_d_2l', this.exp2L, '#FF8C00', 1, 0.85, sxExp);
+                    _pushLvlLine('em_d_3h', this.exp3H, '#FFEE00', 1, 0.75, sxExp);
+                    _pushLvlLine('em_d_3l', this.exp3L, '#FFEE00', 1, 0.75, sxExp);
+                    _pushLvlLine('em_d_4h', this.exp4H, '#FF2244', 2, 0.9, sxExp);
+                    _pushLvlLine('em_d_4l', this.exp4L, '#FF2244', 2, 0.9, sxExp);
+                }
+                if(false && this.wk1H>0){
+                    const sxWk = _lineFromBar(this.weekOpenBar, Math.min(bi, 300));
+                    _pushLvlLine('em_w_1h', this.wk1H, '#B388FF', 2, 0.8, sxWk);
+                    _pushLvlLine('em_w_1l', this.wk1L, '#B388FF', 2, 0.8, sxWk);
+                }
+                if(false && this.mo1H>0){
+                    const sxMo = _lineFromBar(this.monthOpenBar, Math.min(bi, 600));
+                    _pushLvlLine('em_m_1h', this.mo1H, '#FF88DD', 2, 0.7, sxMo);
+                    _pushLvlLine('em_m_1l', this.mo1L, '#FF88DD', 2, 0.7, sxMo);
+                }
 
                 // ═════════════════════════════════════════════════════
                 // SIMPLE MODE — clean signal-focused chart
@@ -2869,7 +3661,7 @@ class MarketReader {
                     }
 
                     // Nearest 2 sigma labels — minimal price context
-                    if(this.exp1H>0){
+                    if(this.exp1H>0 && (this.expDailyIsInput || showFallbackSigmas)){
                         const sigs = [
                             {p:this.exp1H, t:'1σH '+this.exp1H.toFixed(0), c:'#00CCFF'},
                             {p:this.exp1L, t:'1σL '+this.exp1L.toFixed(0), c:'#00CCFF'},
@@ -2889,27 +3681,85 @@ class MarketReader {
                         }
                     }
 
+                    // Weekly / monthly expected-move band labels (colors match
+                    // the plotter lines: weekly = purple, monthly = pink). Only
+                    // shown when that horizon's EM is set (>0).
+                    if(this.wk1H>0){
+                        _items.push({tag:'Text', key:'sm_wkH', text:'WK +EM '+this.wk1H.toFixed(0),
+                            point:{x:_px, y:du(this.wk1H)},
+                            style:{fontSize:_fz(10), fontWeight:'bold', fill:'#B388FF'},
+                            textAlignment:'leftMiddle', global:true});
+                        _items.push({tag:'Text', key:'sm_wkL', text:'WK -EM '+this.wk1L.toFixed(0),
+                            point:{x:_px, y:du(this.wk1L)},
+                            style:{fontSize:_fz(10), fontWeight:'bold', fill:'#B388FF'},
+                            textAlignment:'leftMiddle', global:true});
+                    }
+                    if(this.mo1H>0){
+                        _items.push({tag:'Text', key:'sm_moH', text:'MO +EM '+this.mo1H.toFixed(0),
+                            point:{x:_px, y:du(this.mo1H)},
+                            style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FF88DD'},
+                            textAlignment:'leftMiddle', global:true});
+                        _items.push({tag:'Text', key:'sm_moL', text:'MO -EM '+this.mo1L.toFixed(0),
+                            point:{x:_px, y:du(this.mo1L)},
+                            style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FF88DD'},
+                            textAlignment:'leftMiddle', global:true});
+                    }
+
                     // Tiny status text — top of chart
                     const sessTag = sessSuffix==='_ny'      ? 'NY'    :
                                     sessSuffix==='_eve'     ? 'EVE'   :
                                     sessSuffix==='_asia'    ? 'ASIA'  :
                                     sessSuffix==='_london'  ? 'LON'   :
                                                               'OFF';
-                    let statusText, statusCol;
+                    // ── SINGLE CONSOLIDATED HUD LINE ──────────────────
+                    // Everything you need in one row, anchored ABOVE the
+                    // session high so it never sits on candles. Indicator
+                    // does the heavy lifting; the chart stays clean.
+                    //
+                    // Format:
+                    //   [NY] WATCH 2/3 • Q5 RANGE • DAY ▼-78 P23% IB↓ H1▼ • 2F 0W2L
+                    let _stateTag, _stateCol;
                     if(this.position!==0){
-                        statusText = '['+sessTag+'] IN TRADE  '+this.dailyTrades+'/'+maxTrades;
-                        statusCol = this.position===1?'#00FFCC':'#FF6622';
+                        _stateTag = 'IN-TRADE';
+                        _stateCol = this.position===1?'#00FFCC':'#FF6622';
                     } else if(this.blockReason){
-                        statusText = '['+sessTag+'] BLOCKED: '+this.blockReason+'  '+this.dailyTrades+'/'+maxTrades;
-                        statusCol = '#888888';
+                        _stateTag = this.blockReason;
+                        _stateCol = '#888888';
                     } else {
-                        statusText = '['+sessTag+'] WATCHING  '+this.dailyTrades+'/'+maxTrades;
-                        statusCol = '#AAAAAA';
+                        _stateTag = 'WATCH';
+                        _stateCol = '#AAAAAA';
                     }
-                    _items.push({tag:'Text', key:'sm_status',
-                        text: statusText,
-                        point:{x:_px, y:du(c+atr*1.5)},
-                        style:{fontSize:_fz(11), fontWeight:'bold', fill:statusCol},
+                    const _hudParts = ['['+sessTag+'] '+_stateTag+' '+
+                                       this.dailyTrades+'/'+maxTrades];
+                    const _qNum = (this.dayQuality != null) ? this.dayQuality : 5;
+                    const _msShort = this.marketState && this.marketState !== 'NEUTRAL'
+                        ? ' '+this.marketState : '';
+                    _hudParts.push('Q'+_qNum.toFixed(0)+_msShort);
+                    if(this.sessOpen > 0){
+                        const _dRng2 = Math.max(this.sessHigh - this.sessLow, 0.01);
+                        const _dMv2  = c - this.sessOpen;
+                        const _PIDR2 = (c - this.sessLow) / _dRng2;
+                        const _ibSym = this.ibBroken === 1 ? ' IB↑' :
+                                       this.ibBroken === -1 ? ' IB↓' :
+                                       this.ibLocked ? ' IB·' : '';
+                        const _h1Sym = this.h1Trend === 'BULL' ? ' H1▲' :
+                                       this.h1Trend === 'BEAR' ? ' H1▼' : '';
+                        _hudParts.push('DAY '+(_dMv2>0?'▲':_dMv2<0?'▼':'·')+
+                                       (_dMv2>=0?'+':'')+_dMv2.toFixed(0)+
+                                       ' P'+(_PIDR2*100).toFixed(0)+_ibSym+_h1Sym);
+                    }
+                    if(this.firedCount > 0 || this.blockedCount > 0){
+                        const _wl = (this.sessionWins+this.sessionLosses) > 0
+                            ? ' '+this.sessionWins+'W'+this.sessionLosses+'L'
+                            : '';
+                        _hudParts.push(this.firedCount+'F'+_wl);
+                    }
+                    // Anchor above session high so HUD doesn't touch candles.
+                    const _hudY = (this.sessHigh > 0 ? this.sessHigh : c) + atr * 2;
+                    _items.push({tag:'Text', key:'sm_hud',
+                        text: _hudParts.join('  •  '),
+                        point:{x:_px, y:du(_hudY)},
+                        style:{fontSize:_fz(11), fontWeight:'bold', fill:_stateCol},
                         textAlignment:'leftMiddle', global:true});
 
                     // ── PATTERN DETECTOR DIAGNOSTIC LINE ──
@@ -2999,11 +3849,9 @@ class MarketReader {
                                          '×'+topVote.evidence.length+'/'+topVote.strength);
                         }
                     }
-                    _items.push({tag:'Text', key:'sm_pattern_diag',
-                        text: pdParts.join('  '),
-                        point:{x:_px, y:du(c+atr*1.05)},
-                        style:{fontSize:_fz(10), fontWeight:'normal', fill:_C.diagBlue},
-                        textAlignment:'leftMiddle', global:true});
+                    // Pattern detector diagnostic suppressed in simpleMode
+                    // (user wants a clean chart). Available in full mode.
+                    // _items.push({tag:'Text', key:'sm_pattern_diag', ...})
 
                     // ── DIAGNOSTICS OVERLAY (when diagMode is on) ──
                     // Health badge + recent auto-tune action + missed-setup
@@ -3064,14 +3912,10 @@ class MarketReader {
                     const wlStr = (this.sessionWins + this.sessionLosses) > 0
                         ? ' ('+this.sessionWins+'W/'+this.sessionLosses+'L)'
                         : '';
-                    const jrnText = '📓 '+this.firedCount+' fired'+wlStr+
-                                    ' | '+this.blockedCount+' blocked'+
-                                    ' | '+this.missedCount+' missed';
-                    _items.push({tag:'Text', key:'sm_jrn_summary',
-                        text: jrnText,
-                        point:{x:_px, y:du(c+atr*0.7)},
-                        style:{fontSize:_fz(10), fontWeight:'normal', fill:_C.diagGray},
-                        textAlignment:'leftMiddle', global:true});
+                    // Session counts now folded into the consolidated HUD line
+                    // above. The standalone journal-summary push is suppressed
+                    // in simpleMode for a cleaner chart.
+                    void wlStr;
 
                     // ── JOURNAL: full report (only when showReport=1) ──
                     // Fills the chart with a structured session report:
@@ -3094,7 +3938,7 @@ class MarketReader {
                 const allLvls = [];
 
                 // Sigma bands — ALWAYS visible (lines drawn by expPlotter)
-                if(this.exp1H>0){
+                if(this.exp1H>0 && (this.expDailyIsInput || showFallbackSigmas)){
                     allLvls.push({p:this.exp1H, f:'#00CCFF', s:11, b:false, t:'1σH '+this.exp1H.toFixed(0), always:true});
                     allLvls.push({p:this.exp1L, f:'#00CCFF', s:11, b:false, t:'1σL '+this.exp1L.toFixed(0), always:true});
                     allLvls.push({p:this.exp2H, f:'#FF8C00', s:10, b:false, t:'2σH '+this.exp2H.toFixed(0), always:true});
@@ -3531,10 +4375,77 @@ class MarketReader {
             // an uncaught error stops rendering entirely. We swallow here
             // to keep the indicator alive on edge-case bar data. To debug
             // when running locally, set env.DEBUG_MAP=1 before requiring.
+            // N1: ALSO render a visible error badge. A silently-blank chart is
+            // the dangerous failure mode — it looks identical to "no setups,"
+            // so a crash could go unnoticed while you wait for signals.
+            this._mapErrCount = (this._mapErrCount || 0) + 1;
+            this._lastMapErr  = (e && e.message) ? e.message : String(e);
             if(typeof process !== 'undefined' && process.env && process.env.DEBUG_MAP){
                 console.error('MAP ERROR:', e.message, e.stack);
             }
-            return {graphics:{items:[]}};
+            const _errItems = [];
+            try {
+                const _lastC = (this.C && this.C.length) ? this.C[this.C.length-1] : 0;
+                const _atrB  = Math.max(this.atr || 1, 1);
+                const _ex    = (this.lastChartIdx != null) ? this.lastChartIdx : 0;
+                if(_lastC > 0){
+                    _errItems.push({tag:'Text', key:'map_error',
+                        text:'⚠ INDICATOR ERROR #'+this._mapErrCount+': '+this._lastMapErr,
+                        point:{x:du(_ex), y:du(_lastC + _atrB*3)},
+                        style:{fontSize:18, fontWeight:'bold', fill:'#FF3333'},
+                        textAlignment:'leftMiddle', global:true});
+                }
+            } catch(_e2){ /* never let the error renderer itself throw */ }
+            return {graphics:{items:_errItems}};
+        }
+    }
+
+    // Sigma-level respect tracker — call once per new bar with bi/h/l/c/atr.
+    // Each level (1H/1L/2H/2L/3H/3L/4H/4L) gets touches counted when price
+    // first reaches it, then 5 bars later we classify the outcome:
+    //   reversal — close still on the original side
+    //   break    — close beyond the level (clean breach)
+    _trackSigmaRespect(bi, h, l, c, atr){
+        const lvls = [
+            ['1H', this.exp1H], ['1L', this.exp1L],
+            ['2H', this.exp2H], ['2L', this.exp2L],
+            ['3H', this.exp3H], ['3L', this.exp3L],
+            ['4H', this.exp4H], ['4L', this.exp4L],
+        ];
+        const tol = Math.max(atr * 0.2, this.tickSize * 2);
+        const verifyBars = 5;
+
+        // First, classify any pending touches whose verification window passed
+        for (const k in this.pendingSigma) {
+            const p = this.pendingSigma[k];
+            if (bi - p.hitBar < verifyBars) continue;
+            if (!this.sigmaStats[k]) {
+                this.sigmaStats[k] = { touches:0, reversals:0, breaks:0 };
+            }
+            const s = this.sigmaStats[k];
+            // For an H-level (resistance) hit from below: reversal = close < level, break = close >= level
+            // For an L-level (support) hit from above:    reversal = close > level, break = close <= level
+            const isH = k.endsWith('H');
+            const broken = isH ? (c >= p.levelPrice) : (c <= p.levelPrice);
+            if (broken) s.breaks++; else s.reversals++;
+            delete this.pendingSigma[k];
+        }
+
+        // Then look for fresh touches this bar
+        for (const [k, lvl] of lvls) {
+            if (!lvl || lvl <= 0) continue;
+            if (this.pendingSigma[k]) continue;     // already pending
+            const isH = k.endsWith('H');
+            const touched = isH
+                ? (h >= lvl - tol && c < lvl)       // reached from below, not yet broken
+                : (l <= lvl + tol && c > lvl);      // reached from above, not yet broken
+            if (touched) {
+                if (!this.sigmaStats[k]) {
+                    this.sigmaStats[k] = { touches:0, reversals:0, breaks:0 };
+                }
+                this.sigmaStats[k].touches++;
+                this.pendingSigma[k] = { hitBar: bi, levelPrice: lvl };
+            }
         }
     }
 
@@ -3549,22 +4460,19 @@ class MarketReader {
         const emDaily = (this.props && this.props.expMoveDaily) || 0;
         this.expMid = open;
         if(emDaily > 0){
-            // TRUE options expected-move levels (1-sigma = ATM straddle the user
-            // entered). Bands become 0.5s / 1s / 1.5s / 2s of the implied move,
-            // anchored at the session open. No range floor — a small EM on a
-            // quiet day is itself the signal (tight range expected).
-            this.expSource = 'EM';
+            this.expDailyIsInput = true;
+            // TRUE options expected-move levels: 0.5σ/1σ/1.5σ/2σ of the implied
+            // daily move (the ATM straddle). No historical-range floor.
             this.exp1H=open+emDaily*0.5; this.exp1L=open-emDaily*0.5;
             this.exp2H=open+emDaily;     this.exp2L=open-emDaily;
             this.exp3H=open+emDaily*1.5; this.exp3L=open-emDaily*1.5;
             this.exp4H=open+emDaily*2.0; this.exp4L=open-emDaily*2.0;
         } else {
-            // Fallback: range-based Fibonacci grid (original behaviour).
+            this.expDailyIsInput = false;
             let base = this.avgSessRange>0 ? this.avgSessRange
                      : calRange>150        ? calRange
                      : floor;
             base = Math.max(base, floor);
-            this.expSource = 'RANGE';
             this.exp1H=open+base*0.618; this.exp1L=open-base*0.618;
             this.exp2H=open+base;       this.exp2L=open-base;
             this.exp3H=open+base*1.382; this.exp3L=open-base*1.382;
@@ -4038,8 +4946,11 @@ class MarketReader {
             // Stack: take the higher strength but add a small bonus per
             // additional confirming helper. 2 helpers = +1, 3+ = +2.
             const newCount = v.evidence.length + 1;
-            const stackBonus = newCount >= 3 ? 2 : newCount >= 2 ? 1 : 0;
-            v.strength = Math.min(10, Math.max(v.strength, strength) + (stackBonus - (v.evidence.length >= 2 ? (v.evidence.length >= 3 ? 2 : 1) : 0)));
+            // N7: base = strongest single piece of evidence; +1 at the 2nd
+            // confirmation, +2 at the 3rd+ (capped). Replaces a convoluted
+            // incremental formula that was hard to reason about.
+            const stackBonus = Math.min(2, newCount - 1);
+            v.strength = Math.min(10, Math.max(v.strength, strength) + stackBonus);
             v.evidence.push(evidence);
             // Refine price toward weighted center
             v.price = (v.price * v.evidence.length + price) / (v.evidence.length + 1);
@@ -4992,6 +5903,7 @@ class MarketReader {
         // from absSeq/jhook/sweep/steppingIn). When a strongly-stacked
         // vote aligns with the trade direction at a nearby level, that's
         // independent confirmation worth a vote of its own.
+        const votesBeforeLevel = votes;   // N3: framework/Wyckoff breadth BEFORE the helper vote
         let levelVoteAdded = false;
         let levelVoteStrength = 0;
         let levelVoteEvidence = [];
@@ -5192,12 +6104,17 @@ class MarketReader {
         //   3 votes: fire anywhere
         //   2 votes: fire only at strong level
         //   <2: don't fire
+        // N3: the helper level-vote may CONFIRM (it adds score) and can help meet
+        // the 2-of-3-at-strong-level rule, but it must NOT by itself promote a
+        // weak-level 2-framework setup into the "fire anywhere" tier. The
+        // "fire anywhere" branch uses the PRE-helper breadth.
+        const frameworkBreadth = levelVoteAdded ? votesBeforeLevel : votes;
         if(strongOpposition || this._recentWyckoffBlocks){
             result.fire = false;
-        } else if(votes >= 3){
-            result.fire = true;
-        } else if(votes === 2 && isStrongLevel){
-            result.fire = true;
+        } else if(frameworkBreadth >= 3){
+            result.fire = true;                       // genuine 3-vote breadth → fire anywhere
+        } else if(votes >= 2 && isStrongLevel){
+            result.fire = true;                       // 2+ (helper may count) only at a strong level
         }
         // Minimum average quality
         if(result.fire && finalAvgScore < 5){
@@ -5475,6 +6392,140 @@ class MarketReader {
         };
     }
 
+    // ─────────────────────────────────────────────────────────
+    // MARKET-STATE CLASSIFIER
+    // ─────────────────────────────────────────────────────────
+    // Classify the current market into one of 6 regimes. Used by the
+    // dynamic gate (refuse setups with poor historical WR in this
+    // state) and surfaced in the HUD so the user can see the regime
+    // the indicator is reading.
+    //
+    // States:
+    //   TREND_UP    — slope strongly positive, HH made
+    //   TREND_DOWN  — slope strongly negative, LL made
+    //   ACCUMULATION— slope flat, range tight, CD positive
+    //   DISTRIBUTION— slope flat, range tight, CD negative
+    //   RANGE       — clear bounds, no directional bias
+    //   CHOP        — high-frequency oscillation, no structure
+    //   NEUTRAL     — not enough data yet
+    _classifyMarketState(c, atr) {
+        const N = 20;
+        if (this.C.length < N + 1 || atr <= 0) return 'NEUTRAL';
+        const start = this.C.length - N;
+        // Linear regression slope
+        let sumX=0, sumY=0, sumXY=0, sumX2=0;
+        for (let i = 0; i < N; i++) {
+            const x = i, y = this.C[start + i];
+            sumX += x; sumY += y; sumXY += x*y; sumX2 += x*x;
+        }
+        const denom = (N * sumX2 - sumX * sumX);
+        const slope = denom !== 0 ? (N * sumXY - sumX * sumY) / denom : 0;
+        // Slope projected over the window, normalised to ATR
+        const slopePerATR = (slope * N) / atr;
+
+        // Recent range
+        let hi = -Infinity, lo = Infinity;
+        for (let i = 0; i < N; i++) {
+            if (this.H[start + i] > hi) hi = this.H[start + i];
+            if (this.L[start + i] < lo) lo = this.L[start + i];
+        }
+        const rangePerATR = (hi - lo) / atr;
+
+        // CD direction (sign of cumDelta)
+        const cdDir = this.cumDelta > 50 ? 1 : this.cumDelta < -50 ? -1 : 0;
+
+        // Bar-color skew
+        let upBars = 0, downBars = 0;
+        for (let i = 0; i < N; i++) {
+            const o = this.O[start + i], cc = this.C[start + i];
+            if (cc > o) upBars++; else if (cc < o) downBars++;
+        }
+
+        // Decision tree
+        if (slopePerATR > 1.8 && upBars >= 12) return 'TREND_UP';
+        if (slopePerATR < -1.8 && downBars >= 12) return 'TREND_DOWN';
+        if (Math.abs(slopePerATR) > 0.6) {
+            // Weak trend — call it RANGE if range is tight, TREND if wide
+            return rangePerATR > 4 ? (slopePerATR > 0 ? 'TREND_UP' : 'TREND_DOWN')
+                                    : 'RANGE';
+        }
+        // Flat-ish slope
+        if (rangePerATR < 2.5) {
+            // Tight range — accumulation/distribution by CD direction
+            if (cdDir === 1)  return 'ACCUMULATION';
+            if (cdDir === -1) return 'DISTRIBUTION';
+            return 'RANGE';
+        }
+        if (rangePerATR > 5 && Math.abs(upBars - downBars) < 4) return 'CHOP';
+        return 'RANGE';
+    }
+
+    // Return historical (state, setupTag) stats: win-rate, sample size, and
+    // total P&L. Null if fewer than 5 samples.
+    _stateSetupWR(state, setupTag) {
+        if (!this.stateStats[state]) return null;
+        const s = this.stateStats[state][setupTag];
+        if (!s) return null;
+        const n = s.w + s.l;
+        // N2: require a meaningful sample (was 5) before a per-(state,setup)
+        // record is allowed to gate trading — 5 trades is noise, not evidence.
+        if (n < 20) return null;
+        return { wr: s.w / n, n, pnl: s.pnl };
+    }
+
+    // COIL detector — checks if the last N bars form a compression cluster.
+    // Returns true if:
+    //   - avg range of last N bars < 60% of ATR
+    //   - max-min closes within 1.5 ATR (tight cluster)
+    // Caller then watches the CURRENT bar for a strong-bodied breakout.
+    _detectCoil(bi, atr, lookback) {
+        const N = lookback || 6;
+        const n = this.H.length;
+        if (n < N + 2 || atr <= 0) return null;
+        let sumRng = 0, hi = -Infinity, lo = Infinity;
+        for (let i = n - 1 - N; i < n - 1; i++) {     // exclude current bar
+            const rng = this.H[i] - this.L[i];
+            sumRng += rng;
+            if (this.C[i] > hi) hi = this.C[i];
+            if (this.C[i] < lo) lo = this.C[i];
+        }
+        const avgRng = sumRng / N;
+        if (avgRng > atr * 0.60) return null;         // not tight enough
+        if ((hi - lo) > atr * 1.5) return null;       // closes too spread
+        return { hi, lo, avgRng };
+    }
+
+    // Check the CURRENT bar for a strong-bodied breakout of the coil range.
+    // Returns +1 (bull break), -1 (bear break), or 0.
+    _coilBreakDir(coil, c, o, h, l, atr) {
+        if (!coil || atr <= 0) return 0;
+        const body = Math.abs(c - o);
+        if (body < atr * 1.5) return 0;               // not a decisive bar
+        if (c > coil.hi + atr * 0.1 && c > o) return 1;
+        if (c < coil.lo - atr * 0.1 && c < o) return -1;
+        return 0;
+    }
+
+    // Look for a recent bubble within `lookback` bars near `price` (within
+    // `priceTol` ATR). Returns the strongest match keyed by direction (positive
+    // delta = ask aggression = bullish; negative = bearish). null if none.
+    _recentBubbleAtZone(price, atr, lookback, priceTol, bi) {
+        if (!this.bubbles || this.bubbles.length === 0) return null;
+        const tol = atr * priceTol;
+        let best = null, bestAbs = 0;
+        for (let i = this.bubbles.length - 1; i >= 0; i--) {
+            const b = this.bubbles[i];
+            if ((bi - b.bar) > lookback) break;
+            if (Math.abs(b.price - price) <= tol) {
+                if (Math.abs(b.delta) > bestAbs) {
+                    bestAbs = Math.abs(b.delta);
+                    best = b;
+                }
+            }
+        }
+        return best;
+    }
+
     _findTPs(dir, price, levels, atr){
         const cands = levels
             .map(lv=>lv.price)
@@ -5565,6 +6616,95 @@ class MarketReader {
         }
 
         lines.push('═══ SESSION REPORT ═══');
+        // ── WEEKLY / ALL-TIME PROFITABILITY (across the full journal) ──
+        // Aggregates EVERY recorded EXIT in memory, not just the active
+        // session. Gives the numbers needed to evaluate the indicator's
+        // expectancy + profit factor.
+        const _allExits = this.journal.filter(e => e.type === 'EXIT');
+        if(_allExits.length > 0){
+            let _wPnl = 0, _lPnl = 0, _w = 0, _l = 0, _maxL = 0, _maxW = 0;
+            const _bySess = {};
+            const _bySetup = {};
+            for(const e of _allExits){
+                const _pnl = typeof e.pnl === 'number' ? e.pnl : 0;
+                if(e.win){ _w++; _wPnl += _pnl; if(_pnl > _maxW) _maxW = _pnl; }
+                else      { _l++; _lPnl += _pnl; if(_pnl < _maxL) _maxL = _pnl; }
+                const _ses = e.session || 'UNKNOWN';
+                if(!_bySess[_ses]) _bySess[_ses] = {w:0,l:0,pnl:0};
+                _bySess[_ses][e.win?'w':'l']++;
+                _bySess[_ses].pnl += _pnl;
+            }
+            const _tot = _w + _l;
+            const _wr  = _tot>0 ? Math.round(_w/_tot*100) : 0;
+            const _avgW = _w>0 ? (_wPnl/_w) : 0;
+            const _avgL = _l>0 ? (_lPnl/_l) : 0;
+            const _grossW = _wPnl;
+            const _grossL = Math.abs(_lPnl);
+            const _pf = _grossL>0 ? (_grossW/_grossL).toFixed(2) : '∞';
+            const _expPt = _tot>0 ? ((_wPnl + _lPnl) / _tot) : 0;
+            const _net$ = Math.round((_wPnl + _lPnl) * (this.autoContractValue || 2));
+            lines.push('━━━ WEEKLY / ALL-TIME ━━━');
+            lines.push('Trades '+_tot+'  W '+_w+'/L '+_l+'  WR '+_wr+'%');
+            lines.push('Net '+(_net$>=0?'+$':'-$')+Math.abs(_net$)+
+                       '  ('+(_wPnl+_lPnl>=0?'+':'')+(_wPnl+_lPnl).toFixed(1)+'pt)');
+            lines.push('AvgW '+(_avgW>=0?'+':'')+_avgW.toFixed(1)+'pt'+
+                       '  AvgL '+_avgL.toFixed(1)+'pt'+
+                       '  Exp '+(_expPt>=0?'+':'')+_expPt.toFixed(2)+'pt/trade');
+            lines.push('PF '+_pf+
+                       '  MaxW '+_maxW.toFixed(1)+'pt'+
+                       '  MaxL '+_maxL.toFixed(1)+'pt');
+            // Sigma respect — how often each level holds vs breaks.
+            const _sigKeys = Object.keys(this.sigmaStats || {});
+            if(_sigKeys.length > 0){
+                lines.push('Sigma respect:');
+                const _order = ['1H','1L','2H','2L','3H','3L','4H','4L'];
+                for(const _sk of _order){
+                    const _ss = this.sigmaStats[_sk];
+                    if(!_ss || _ss.touches < 1) continue;
+                    const _resolved = _ss.reversals + _ss.breaks;
+                    const _pct = _resolved>0 ? Math.round(_ss.reversals/_resolved*100) : 0;
+                    lines.push('  '+_sk+': '+_ss.touches+' touches, '+
+                               _ss.reversals+' reversals ('+_pct+'%)');
+                }
+            }
+            // Bubble baseline for this chart — useful for tuning the
+            // contra/hold floor params per chart (NY 4096t vs EVE 3072t).
+            if(this.bubbleAvgAbs > 0){
+                lines.push('Bubble avg|Δ|: '+this.bubbleAvgAbs.toFixed(0)+
+                           '  contra≥'+Math.max(
+                               (this.props && this.props.bubbleContraFloor!=null?this.props.bubbleContraFloor:200),
+                               this.bubbleAvgAbs * 1.5).toFixed(0));
+            }
+            // Per-day rollup
+            const _dayKeys = Object.keys(_bySess).sort();
+            if(_dayKeys.length > 0){
+                lines.push('Per session:');
+                for(const _sk of _dayKeys.slice(-7)){
+                    const _s = _bySess[_sk];
+                    const _spt = (_s.pnl).toFixed(1);
+                    lines.push('  '+_sk+'  '+_s.w+'W/'+_s.l+'L  '+
+                               (_s.pnl>=0?'+':'')+_spt+'pt');
+                }
+            }
+            // Per-state-per-setup table (online learning summary)
+            const _stKeys = Object.keys(this.stateStats || {});
+            if(_stKeys.length > 0){
+                lines.push('Per state × level type:');
+                for(const _st of _stKeys){
+                    const _setups = this.stateStats[_st];
+                    for(const _lt in _setups){
+                        const _ss = _setups[_lt];
+                        const _stTot = _ss.w + _ss.l;
+                        if(_stTot < 1) continue;
+                        const _stwr = Math.round(_ss.w/_stTot*100);
+                        lines.push('  '+_st+' × '+_lt+': '+
+                                   _ss.w+'W/'+_ss.l+'L ('+_stwr+'%)  '+
+                                   (_ss.pnl>=0?'+':'')+_ss.pnl.toFixed(1)+'pt');
+                    }
+                }
+            }
+            lines.push('───────────────────────');
+        }
         lines.push('Session: '+showSession+(isCurrent?' (live)':' (closed)'));
         lines.push('Fired: '+firedC+
                    '  Wins: '+winsC+
@@ -5780,6 +6920,10 @@ class MarketReader {
     //   • Probation tracking: monitors if change improved capture rate;
     //     reverts if next 100 bars show worse output
     _autoTune(bi, calib){
+        // Forward-test / honesty guard: when params are frozen the strategy is
+        // a STABLE target you can measure. Auto-tuning mid-test makes every
+        // trade a different system → expectancy becomes meaningless.
+        if((this.props||{}).freezeTuning) return null;
         // Don't tune if not OK
         if(this.healthVerdict !== 'OK') return null;
         if(!calib.calibrationOff) return null;
@@ -5910,8 +7054,7 @@ function expPlotter(canvas, indicator, history){
         if(e3L) canvas.drawLine(pt.offset(sx,e3L), pt.offset(ex,e3L), {color:'#FFEE00',lineWidth:1,opacity:0.75});
         if(e4H) canvas.drawLine(pt.offset(sx,e4H), pt.offset(ex,e4H), {color:'#FF2244',lineWidth:2,opacity:0.9});
         if(e4L) canvas.drawLine(pt.offset(sx,e4L), pt.offset(ex,e4L), {color:'#FF2244',lineWidth:2,opacity:0.9});
-        // Weekly (purple) / monthly (pink) expected-move bands, anchored at the
-        // week/month open and spanning across the chart.
+        // Weekly (purple) / monthly (pink) expected-move bands at week/month open
         let wkH=null,wkL=null,wkSx=null, moH=null,moL=null,moSx=null;
         const curWk=indicator.weekKey, curMo=indicator.monthKey;
         for(let i=0;i<history.data.length;i++){
@@ -5931,21 +7074,26 @@ module.exports = {
     name:       'SD_MarketReader',
     calculator: MarketReader,
     inputType:  'bars',
+    // Enable per-bar volume-profile data (d.profile()) so the bubble
+    // detector can read price-level bid/ask volume.
+    requirements: {
+        volumeProfiles: true,
+    },
     plotter: [
         predef.plotters.custom(expPlotter)
     ],
     params: {
         tzOffsetHours: predef.paramSpecs.number(-4,1,-12),
-        // EXPECTED MOVE (options-implied): the daily 1-sigma move in points.
-        // Read the front-expiry ATM straddle (ATM call + ATM put price) off the
-        // NQ options chain each morning and enter it here. 0 = auto (fall back
-        // to the average session range — the original behaviour). When set, the
-        // sigma bands become TRUE expected-move levels: 0.5s / 1s / 1.5s / 2s.
-        expMoveDaily: predef.paramSpecs.number(0, 25, 0),
-        // Weekly / monthly 1-sigma expected move in points (the weekly and
-        // monthly ATM straddles). 0 = off. Anchored at the week/month open.
-        expMoveWeekly:  predef.paramSpecs.number(0, 50, 0),
-        expMoveMonthly: predef.paramSpecs.number(0, 100, 0),
+        // Expected-move levels (options-implied). Paste the 1-sigma ATM straddle
+        // in points per horizon. 0 = off (falls back to historical-range sigmas).
+        // Daily drives the sigma bands; weekly/monthly draw their own.
+        expMoveDaily:   predef.paramSpecs.number(0, 1, 0),
+        expMoveWeekly:  predef.paramSpecs.number(0, 1, 0),
+        expMoveMonthly: predef.paramSpecs.number(0, 1, 0),
+        // 0 = hide historical fallback sigmas from the chart. They remain
+        // available internally, but only true user-entered expected moves
+        // draw by default.
+        showFallbackSigmas: predef.paramSpecs.number(0, 1, 0),
         // contractValuePt: $/point per contract. Set to 0 (default) to
         // let the indicator auto-detect from the instrument profile —
         // MNQ=$2, MGC=$10. Override only if you trade full contracts
@@ -5954,6 +7102,22 @@ module.exports = {
         maxDailyLoss:    predef.paramSpecs.number(400,50,0),
         maxDailyTrades:  predef.paramSpecs.number(8,1,1),
         riskPerTrade:    predef.paramSpecs.number(100,25,0),
+        // maxContracts: hard cap on risk-based size (H4). qty = floor(
+        //   riskPerTrade / per-contract$ risk), clamped to [1, this].
+        maxContracts:    predef.paramSpecs.number(10,1,1),
+        // maxStopAtr: hard cap on stop distance in ATRs (N4). Bounds per-trade
+        //   risk when a level-anchored stop would otherwise be very wide.
+        maxStopAtr:      predef.paramSpecs.number(3.0, 0.5, 1.0),
+        // instrument: 0=auto-detect from price, 1=NQ/MNQ, 2=GC/MGC (M2).
+        instrument:      predef.paramSpecs.number(0,1,0),
+        // ── FORWARD-TEST / HONESTY CONTROLS ──
+        // freezeTuning: 1 = lock auto-tuned detection params (REQUIRED for a
+        //   valid forward test). Default flipped to 1 — auto-tune is curve-fit
+        //   risk; set 0 to restore the old self-adjusting behavior.
+        freezeTuning:  predef.paramSpecs.number(1,1,0),
+        // forwardLog: 1 = print one 'SDTRADE,' line per closed trade. Defaults ON
+        //   (forward-test build) so it's paste-and-go; set 0 to silence the log.
+        forwardLog:    predef.paramSpecs.number(1,1,0),
         // Session toggles — 1=on, 0=off. NY+Evening on by default.
         tradeNY:       predef.paramSpecs.number(1,1,0),
         tradeEvening:  predef.paramSpecs.number(1,1,0),
@@ -6040,6 +7204,25 @@ module.exports = {
         //   backgrounds (cyan/magenta/lime instead of muted variants).
         //   0 = standard. Default 1 since most users have dark theme.
         brightMode:        predef.paramSpecs.number(1, 1, 0),
+        // ── DELTA BUBBLES (Sethmo-style) ──────────────────────────
+        // bubbleThreshold: minimum |askVol-bidVol| in a price bucket to
+        //   register as a bubble. 120 is reasonable for MNQ; raise for
+        //   noisy contracts, lower for thin volume.
+        // bubblePriceLevels: bucket size in ticks. 6 ticks/bucket on
+        //   tick charts gives clean readings; larger on time charts.
+        // bubbleThreshold: minimum |delta| for a bucket to register as a
+        //   bubble at all. Floor for the rolling average. Tune per chart:
+        //   NY 4096-tick ≈ 120-200, EVE 3072-tick ≈ 60-120, ES/NQ full
+        //   contracts ≈ 250-400.
+        bubbleThreshold:   predef.paramSpecs.number(120, 10, 0),
+        bubblePriceLevels: predef.paramSpecs.number(6, 1, 1),
+        // Contra/hold thresholds are computed as max(floor, avgBubble × mult).
+        // Keeps the filter meaningful regardless of which tick chart is
+        // running — the ema of bubbleAvgAbs auto-tunes to each chart.
+        bubbleContraFloor: predef.paramSpecs.number(200, 25, 0),
+        bubbleContraMult:  predef.paramSpecs.number(1.5, 0.1, 0.5),
+        bubbleHoldFloor:   predef.paramSpecs.number(250, 25, 0),
+        bubbleHoldMult:    predef.paramSpecs.number(1.8, 0.1, 0.5),
     },
     plots: {},
     schemeStyles: { dark: {} },

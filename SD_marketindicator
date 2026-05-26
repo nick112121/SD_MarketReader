@@ -3529,15 +3529,30 @@ class MarketReader {
                       sk.includes('_asia')   ? 175 :
                                                 150;
         const calRange = this.calDayH>0&&this.calDayL<999999 ? this.calDayH-this.calDayL : 0;
-        let base = this.avgSessRange>0 ? this.avgSessRange
-                 : calRange>150        ? calRange
-                 : floor;
-        base = Math.max(base, floor);
+        const emDaily = (this.props && this.props.expMoveDaily) || 0;
         this.expMid = open;
-        this.exp1H=open+base*0.618; this.exp1L=open-base*0.618;
-        this.exp2H=open+base;       this.exp2L=open-base;
-        this.exp3H=open+base*1.382; this.exp3L=open-base*1.382;
-        this.exp4H=open+base*1.618; this.exp4L=open-base*1.618;
+        if(emDaily > 0){
+            // TRUE options expected-move levels (1-sigma = ATM straddle the user
+            // entered). Bands become 0.5s / 1s / 1.5s / 2s of the implied move,
+            // anchored at the session open. No range floor — a small EM on a
+            // quiet day is itself the signal (tight range expected).
+            this.expSource = 'EM';
+            this.exp1H=open+emDaily*0.5; this.exp1L=open-emDaily*0.5;
+            this.exp2H=open+emDaily;     this.exp2L=open-emDaily;
+            this.exp3H=open+emDaily*1.5; this.exp3L=open-emDaily*1.5;
+            this.exp4H=open+emDaily*2.0; this.exp4L=open-emDaily*2.0;
+        } else {
+            // Fallback: range-based Fibonacci grid (original behaviour).
+            let base = this.avgSessRange>0 ? this.avgSessRange
+                     : calRange>150        ? calRange
+                     : floor;
+            base = Math.max(base, floor);
+            this.expSource = 'RANGE';
+            this.exp1H=open+base*0.618; this.exp1L=open-base*0.618;
+            this.exp2H=open+base;       this.exp2L=open-base;
+            this.exp3H=open+base*1.382; this.exp3L=open-base*1.382;
+            this.exp4H=open+base*1.618; this.exp4L=open-base*1.618;
+        }
     }
 
     _update1hr(){
@@ -5890,6 +5905,12 @@ module.exports = {
     ],
     params: {
         tzOffsetHours: predef.paramSpecs.number(-4,1,-12),
+        // EXPECTED MOVE (options-implied): the daily 1-sigma move in points.
+        // Read the front-expiry ATM straddle (ATM call + ATM put price) off the
+        // NQ options chain each morning and enter it here. 0 = auto (fall back
+        // to the average session range — the original behaviour). When set, the
+        // sigma bands become TRUE expected-move levels: 0.5s / 1s / 1.5s / 2s.
+        expMoveDaily: predef.paramSpecs.number(0, 25, 0),
         // contractValuePt: $/point per contract. Set to 0 (default) to
         // let the indicator auto-detect from the instrument profile —
         // MNQ=$2, MGC=$10. Override only if you trade full contracts

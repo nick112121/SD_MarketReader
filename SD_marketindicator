@@ -56,11 +56,11 @@ const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a
 
 class MarketReader {
 
-    init(props) {
-        // Accept props from test harness or Tradovate. In Tradovate, props
-        // are wired via `this.props` before map() is called; for testing
-        // we accept them here.
-        if(props) this.props = props;
+    init() {
+        // Tradovate calls init() with NO arguments and wires the params onto
+        // this.props itself before map() runs. Do not declare/assign props
+        // here — taking an argument or assigning this.props can interfere
+        // with the framework's parameter binding.
         this.H=[]; this.L=[]; this.O=[]; this.C=[]; this.V=[]; this.D=[];
         this.barIdx=0;
         this.lastChartIdx=0;

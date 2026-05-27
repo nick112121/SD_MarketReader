@@ -190,6 +190,10 @@ class MarketReader {
         // current session open. Holds this morning's open through the EVE/
         // Asia/London sessions until the next NY open fires.
         this.rthOpen=0; this.rthOpenBar=0;
+        // State for the interpolated 9:30-open auto-detect (2 completed bars
+        // bracketing 9:30, computed once per day).
+        this._bar1Close=0; this._bar1Ts=0; this._bar2Close=0; this._bar2Ts=0;
+        this._rthDayKey='';
         this.calDayKey=''; this.calDayH=0; this.calDayL=999999;
         this.sessRanges=[]; this.avgSessRange=0;
         this.voids=[];
@@ -603,15 +607,43 @@ class MarketReader {
                     this.D[arrIdx] = delta;
                 }
             } else {
-                // First time seeing this timestamp — append
+                // First time seeing this timestamp — append.
                 isNewBar = true;
                 this.barIdx++;
+                // Roll a 2-deep history of COMPLETED bars (close + timestamp)
+                // for the 9:30-open interpolation below. Before this push,
+                // this.C's last entry is the just-completed previous bar.
+                if(this.C.length > 0){
+                    this._bar2Close = this._bar1Close; this._bar2Ts = this._bar1Ts;
+                    this._bar1Close = this.C[this.C.length-1];
+                    this._bar1Ts    = this._lastBarTs;
+                }
                 this.H.push(h); this.L.push(l); this.O.push(o);
                 this.C.push(c); this.V.push(vol); this.D.push(delta);
                 arrIdx = this.H.length - 1;
                 if(_curTs != null) this._tsIndex.set(_curTs, arrIdx);
             }
             this._lastBarTs = _curTs;
+
+            // ── AUTO 9:30 RTH OPEN (interpolated) ─────────────────────────
+            // Tick bars don't break at 9:30, so no bar's open IS the 9:30
+            // print. But once the bar that closes just after 9:30 is done,
+            // the two completed bars on either side of 9:30 bracket it — and
+            // linear-interpolating their closes to the 9:30 timestamp gives a
+            // close estimate of the open. Runs once per day; the manual
+            // rthOpen setting (if > 0) overrides this everywhere downstream.
+            if(isNewBar && this._bar1Close > 0 && this._bar2Close > 0){
+                const _open930Adj = Date.UTC(lt.getUTCFullYear(), lt.getUTCMonth(), lt.getUTCDate(), 9, 30, 0, 0);
+                const _tCross = _open930Adj - tz*3600000;
+                const _dk = lt.getUTCFullYear()+'-'+(lt.getUTCMonth()+1)+'-'+lt.getUTCDate();
+                if(this._rthDayKey !== _dk && this._bar2Ts < _tCross && _tCross <= this._bar1Ts){
+                    const _span = this._bar1Ts - this._bar2Ts;
+                    const _f = _span > 0 ? (_tCross - this._bar2Ts) / _span : 0;
+                    this.rthOpen = this._bar2Close + (this._bar1Close - this._bar2Close) * _f;
+                    this.rthOpenBar = this.barIdx;
+                    this._rthDayKey = _dk;
+                }
+            }
 
             // For replay passes, the per-bar calculations would re-run
             // the work that was already done on the original pass. The

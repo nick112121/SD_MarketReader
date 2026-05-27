@@ -10,10 +10,10 @@ services:
         value: "3.12.0"
   # All-in-one expected-move page — ES/NQ/YM/RTY ranked by how far each has
   # travelled vs its own daily EM (who's leading), with each market's daily
-  # S/R levels and the paste-able daily/weekly/monthly EM numbers. Replaces
-  # the old single-NQ page. (uvicorn four_em:app)
+  # S/R levels and the paste-able daily/weekly/monthly EM numbers. Keeps the
+  # original service name so the existing URL still works. (uvicorn four_em:app)
   - type: web
-    name: four-market-em
+    name: nq-expected-move
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt

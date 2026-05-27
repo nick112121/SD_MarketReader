@@ -33,20 +33,25 @@ const plottingTools  = require('./tools/plotting');
 // ── CONSTANTS ────────────────────────────────────────────────────────────
 const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast)
 // ╔══════════════════════════════════════════════════════════════════════╗
-// ║  EXPECTED-MOVE INPUTS — EDIT THESE 4 NUMBERS EACH MORNING             ║
-// ║  Type them HERE in the code, NOT in the indicator's Settings panel.   ║
-// ║  Tradovate does not pass custom settings to this indicator, so the    ║
-// ║  Settings fields are ignored — these constants are what actually draw.║
+// ║  EXPECTED MOVE — PASTE ONE NUMBER EACH MORNING                        ║
 // ║                                                                       ║
-// ║  Get all four off the EM page. ANCHOR is the NQ price the page used   ║
-// ║  (shown in its context line / the midpoint of R2 & S2). The three EM  ║
-// ║  values are the 1-sigma point moves. With ANCHOR + the EMs, every     ║
-// ║  band lands exactly where the page's R/S, Week and Month levels are.  ║
+// ║  Set EM_DAILY to today's daily expected move (off the EM page). That  ║
+// ║  is the ONLY thing you edit. The indicator does the rest:             ║
+// ║    • daily bands  = open ± EM_DAILY × {0.5, 1, 1.5, 2}                 ║
+// ║    • weekly band  = week-open  ± EM_DAILY × √5   (auto-derived)        ║
+// ║    • monthly band = month-open ± EM_DAILY × √21  (auto-derived)        ║
+// ║    • anchors are auto-detected (daily = 9:30 RTH open)                 ║
+// ║                                                                       ║
+// ║  Edit it HERE in the code, not the Settings panel — Tradovate does    ║
+// ║  not pass custom settings to this indicator.                          ║
+// ║                                                                       ║
+// ║  The three OVERRIDES below are optional; leave them 0 for full auto.  ║
 // ╚══════════════════════════════════════════════════════════════════════╝
-const RTH_OPEN   = 30098;  // ANCHOR: the NQ price the EM page used (0 = auto)
-const EM_DAILY   = 455;    // daily 1-sigma (points)  → R1/R2/S1/S2 bands
-const EM_WEEKLY  = 1013;   // weekly 1-sigma (points)  (0 = hide)
-const EM_MONTHLY = 2077;   // monthly 1-sigma (points) (0 = hide)
+const EM_DAILY   = 455;  // ← the one number: today's daily expected move (pts)
+// Optional overrides (0 = auto):
+const EM_WEEKLY  = 0;    // 0 = derive from daily ×√5 ; set a number to force it
+const EM_MONTHLY = 0;    // 0 = derive from daily ×√21; set a number to force it
+const RTH_OPEN   = 0;    // 0 = auto-anchor at the 9:30 RTH open; or paste it
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
 const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)
@@ -1028,20 +1033,19 @@ class MarketReader {
             // Monthly anchor + weekly/monthly expected-move bands (options-implied)
             const _monthKey = wkBase.y+'-'+wkBase.m;
             if(isNewBar && _monthKey!==this.monthKey){ this.monthKey=_monthKey; this.monthOpen=o; this.monthOpenBar=bi; }
+            // Weekly/monthly EM auto-derive from the one daily number
+            // (EM scales with √time: week=√5, month=√21). Overridable.
+            let _emDForBands=(p.expMoveDaily!=null?Number(p.expMoveDaily):0)||0;
+            if(!(_emDForBands>0)) _emDForBands=EM_DAILY;
             let _emW=(p.expMoveWeekly!=null?Number(p.expMoveWeekly):0)||0;
-            if(!(_emW>0)) _emW=EM_WEEKLY;
+            if(!(_emW>0)) _emW = EM_WEEKLY>0 ? EM_WEEKLY : _emDForBands*Math.sqrt(5);
             let _emM=(p.expMoveMonthly!=null?Number(p.expMoveMonthly):0)||0;
-            if(!(_emM>0)) _emM=EM_MONTHLY;
-            // Anchor weekly/monthly at the SAME reference as the daily bands
-            // (the pasted RTH_OPEN), so all three line up with the EM page,
-            // which quotes every horizon off one price.
-            const _bandAnchor = RTH_OPEN>0     ? RTH_OPEN
-                              : this.rthOpen>0  ? this.rthOpen
-                              : this.sessOpen>0 ? this.sessOpen : c;
-            this.wk1H=(_bandAnchor>0&&_emW>0)?_bandAnchor+_emW:0;
-            this.wk1L=(_bandAnchor>0&&_emW>0)?_bandAnchor-_emW:0;
-            this.mo1H=(_bandAnchor>0&&_emM>0)?_bandAnchor+_emM:0;
-            this.mo1L=(_bandAnchor>0&&_emM>0)?_bandAnchor-_emM:0;
+            if(!(_emM>0)) _emM = EM_MONTHLY>0 ? EM_MONTHLY : _emDForBands*Math.sqrt(21);
+            // Weekly anchors at the week open, monthly at the month open.
+            this.wk1H=(this.weekOpen>0&&_emW>0)?this.weekOpen+_emW:0;
+            this.wk1L=(this.weekOpen>0&&_emW>0)?this.weekOpen-_emW:0;
+            this.mo1H=(this.monthOpen>0&&_emM>0)?this.monthOpen+_emM:0;
+            this.mo1L=(this.monthOpen>0&&_emM>0)?this.monthOpen-_emM:0;
 
             // ── DAILY CANDLE — futures-session boundary at 5 PM EDT ──
             let fLth = lth;
@@ -7114,13 +7118,16 @@ function expPlotter(canvas, indicator, history){
         }
 
         // ── Weekly (purple) / monthly (pink) bands ─────────────────────────
-        // Anchored at the same reference as the daily bands (matches the page).
+        // Auto-derived from the one daily number (week=×√5, month=×√21) and
+        // anchored at the week open / month open. Overridable via the consts.
         let emW = (indicator.props && Number(indicator.props.expMoveWeekly)) || 0;
-        if(!(emW > 0)) emW = EM_WEEKLY;
+        if(!(emW > 0)) emW = EM_WEEKLY > 0 ? EM_WEEKLY : em*Math.sqrt(5);
         let emM = (indicator.props && Number(indicator.props.expMoveMonthly)) || 0;
-        if(!(emM > 0)) emM = EM_MONTHLY;
-        if(anchor > 0 && emW > 0){ span(anchor+emW, '#B388FF', 2, 0.8); span(anchor-emW, '#B388FF', 2, 0.8); }
-        if(anchor > 0 && emM > 0){ span(anchor+emM, '#FF88DD', 2, 0.7); span(anchor-emM, '#FF88DD', 2, 0.7); }
+        if(!(emM > 0)) emM = EM_MONTHLY > 0 ? EM_MONTHLY : em*Math.sqrt(21);
+        const wkA = indicator.weekOpen || 0;
+        const moA = indicator.monthOpen || 0;
+        if(wkA > 0 && emW > 0){ span(wkA+emW, '#B388FF', 2, 0.8); span(wkA-emW, '#B388FF', 2, 0.8); }
+        if(moA > 0 && emM > 0){ span(moA+emM, '#FF88DD', 2, 0.7); span(moA-emM, '#FF88DD', 2, 0.7); }
     } catch(e){}
 }
 

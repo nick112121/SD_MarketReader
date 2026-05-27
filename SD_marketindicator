@@ -49,7 +49,7 @@ const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast
 const EM_DAILY   = 455;  // daily move — update every morning (points)
 const EM_WEEKLY  = 0;    // weekly move — set Mondays, held all week (0 = off)
 const EM_MONTHLY = 0;    // monthly move — set at month start, held (0 = off)
-const RTH_OPEN   = 0;    // 0 = auto-anchor at the 9:30 RTH open; or paste it
+const RTH_OPEN   = 29902; // today's exact 9:30 RTH open (0 = auto-detect)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
 const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)

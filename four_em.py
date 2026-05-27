@@ -96,6 +96,7 @@ def compute() -> dict:
             sig_pct, src = _daily_sigma_pct(sub["Close"], vc)
             em_d = cur * sig_pct
             em_w = em_d * np.sqrt(5)
+            em_m = em_d * np.sqrt(21)
             move = cur - open_today
             wk_move = cur - week_open
             sd = move / em_d if em_d else 0.0
@@ -104,13 +105,20 @@ def compute() -> dict:
                 "code": code, "name": name,
                 "price": round(cur, 2), "open": round(open_today, 2),
                 "weekOpen": round(week_open, 2),
-                "emD": int(round(em_d)), "emW": int(round(em_w)),
+                "emD": int(round(em_d)), "emW": int(round(em_w)), "emM": int(round(em_m)),
                 "moveD": round(move, 1),
                 "sigD": round(sd, 2), "sigW": round(sw, 2),
                 "pctD": int(round(abs(sd) * 100)),
                 "dir": 1 if move >= 0 else -1,
                 "vol": round(vc, 2) if vc else None, "volSrc": src,
                 "status": _status(sd, sw),
+                # daily S/R levels, anchored at the open (same as the indicator)
+                "lvls": {
+                    "r2": round(open_today + em_d, 1),
+                    "r1": round(open_today + em_d * 0.5, 1),
+                    "s1": round(open_today - em_d * 0.5, 1),
+                    "s2": round(open_today - em_d, 1),
+                },
             })
         except Exception as e:
             rows.append({"code": code, "name": name, "error": str(e)})
@@ -163,14 +171,20 @@ h1{font-size:.8rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;ma
 .status{font-size:.72rem;color:#bbb}
 .meta{display:flex;gap:12px;font-size:.62rem;color:#666;margin-top:7px;flex-wrap:wrap}
 .meta b{color:#aaa;font-weight:600}
+.lvls{display:flex;gap:10px;font-size:.6rem;margin-top:6px;flex-wrap:wrap}
+.lvls span{color:#777}
+.lvls .r{color:#00cc88}.lvls .s{color:#ff6688}
+.em{display:flex;gap:10px;font-size:.62rem;margin-top:6px;flex-wrap:wrap;border-top:1px solid #1c1c1c;padding-top:6px}
+.em b{color:#00ff88;font-weight:700}.em span{color:#888}
 .note{font-size:.62rem;color:#666;text-align:center;margin:14px 0;line-height:1.6}
 </style></head><body>
 <h1>4-Market Expected Move</h1>
 <div class=regime id=regime>...</div>
 <div id=cards></div>
-<div class=note>Daily EM = today's 1σ move from the open. σ = how many daily EMs
-price has travelled (1.0 = exactly at the daily expected move). Ranked by who's
-moved furthest — the leader is on top. Free delayed data (~15 min). Reloads every 60s.</div>
+<div class=note>σ = how many daily EMs price has travelled from the open (1.0 = exactly at
+the daily expected move). Ranked by who's moved furthest — leader on top. R/S =
+daily EM levels (open ±0.5/1 EM). "paste" = the daily/weekly/monthly numbers to
+drop into the indicator. Free delayed data (~15 min). Reloads every 60s.</div>
 <script>
 function bar(sd){
   // map -2..+2 sigma to 0..100%, center at 50
@@ -203,11 +217,19 @@ async function go(){
       +'<div class=meta>'
       +'<span><b>'+r.price.toLocaleString()+'</b> px</span>'
       +'<span>open <b>'+r.open.toLocaleString()+'</b></span>'
-      +'<span>day EM <b>'+r.emD.toLocaleString()+'</b></span>'
-      +'<span>wk EM <b>'+r.emW.toLocaleString()+'</b></span>'
       +'<span>wk <b>'+r.sigW.toFixed(2)+'σ</b></span>'
       +'<span>vol <b>'+(r.vol!=null?r.vol:'—')+'</b> ('+r.volSrc+')</span>'
-      +'</div></div>';
+      +'</div>'
+      +'<div class=lvls>'
+      +'<span class=r>R2 '+r.lvls.r2.toLocaleString()+'</span>'
+      +'<span class=r>R1 '+r.lvls.r1.toLocaleString()+'</span>'
+      +'<span class=s>S1 '+r.lvls.s1.toLocaleString()+'</span>'
+      +'<span class=s>S2 '+r.lvls.s2.toLocaleString()+'</span>'
+      +'</div>'
+      +'<div class=em>paste → <span>daily <b>'+r.emD.toLocaleString()+'</b></span>'
+      +'<span>weekly <b>'+r.emW.toLocaleString()+'</b></span>'
+      +'<span>monthly <b>'+r.emM.toLocaleString()+'</b></span></div>'
+      +'</div>';
   });
   document.getElementById('cards').innerHTML=h;
 }

@@ -49,6 +49,7 @@ const EM_DAILY   = 0;    // fallback daily move  (0 = use Settings)
 const EM_WEEKLY  = 0;    // fallback weekly move (0 = use Settings / off)
 const EM_MONTHLY = 0;    // fallback monthly move(0 = use Settings / off)
 const RTH_OPEN   = 0;    // fallback 9:30 open   (0 = use Settings / auto)
+const EM_ZONE_PTS = 0;   // fallback zone half-height in pts (0 = thin lines)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
 const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)
@@ -7125,6 +7126,28 @@ function expPlotter(canvas, indicator, history){
             if(!(y>0)) return;
             canvas.drawLine(pt.offset(lx,y), pt.offset(ex,y), {color:color,lineWidth:width,opacity:opacity});
         };
+        // Zone half-height in points (Settings emZonePts, else constant). 0 =
+        // plain lines. A zone is drawn as faint shading between two edge lines
+        // at level ± halfwidth, with the exact level as a center line — the
+        // canvas has no fill primitive, so the shading is stacked thin lines.
+        let zoneHalf = (indicator.props && Number(indicator.props.emZonePts)) || 0;
+        if(!(zoneHalf > 0)) zoneHalf = EM_ZONE_PTS;
+        const band = (yc, color, emph)=>{
+            if(!(yc > 0)) return;
+            if(zoneHalf > 0){
+                const top = yc + zoneHalf, bot = yc - zoneHalf;
+                const N = 12;                       // shading density
+                for(let k=1;k<N;k++){
+                    const yy = bot + (top - bot) * (k / N);
+                    canvas.drawLine(pt.offset(lx,yy), pt.offset(ex,yy), {color:color, lineWidth:3, opacity:0.08});
+                }
+                canvas.drawLine(pt.offset(lx,top), pt.offset(ex,top), {color:color, lineWidth:1, opacity:emph?0.55:0.4});
+                canvas.drawLine(pt.offset(lx,bot), pt.offset(ex,bot), {color:color, lineWidth:1, opacity:emph?0.55:0.4});
+                canvas.drawLine(pt.offset(lx,yc),  pt.offset(ex,yc),  {color:color, lineWidth:1, opacity:emph?0.9:0.55});
+            } else {
+                canvas.drawLine(pt.offset(lx,yc), pt.offset(ex,yc), {color:color, lineWidth:emph?2:1, opacity:emph?1.0:0.8});
+            }
+        };
 
         // ── Daily expected-move bands ──────────────────────────────────────
         // EM value: the setting if Tradovate passes it, else the EM_DAILY
@@ -7138,15 +7161,15 @@ function expPlotter(canvas, indicator, history){
                    : indicator.rthOpen > 0   ? indicator.rthOpen
                    : indicator.sessOpen > 0  ? indicator.sessOpen : 0;
         if(anchor > 0 && em > 0){
-            span(anchor,         '#00FF88', 1, 0.35);  // 9:30 open
-            span(anchor+em*0.5,  '#00CCFF', 2, 1.0);   // ±0.5σ
-            span(anchor-em*0.5,  '#00CCFF', 2, 1.0);
-            span(anchor+em,      '#FF8C00', 1, 0.85);   // ±1σ
-            span(anchor-em,      '#FF8C00', 1, 0.85);
-            span(anchor+em*1.5,  '#FFEE00', 1, 0.75);   // ±1.5σ
-            span(anchor-em*1.5,  '#FFEE00', 1, 0.75);
-            span(anchor+em*2.0,  '#FF2244', 2, 0.9);    // ±2σ
-            span(anchor-em*2.0,  '#FF2244', 2, 0.9);
+            span(anchor, '#00FF88', 1, 0.35);          // 9:30 open (stays a thin line)
+            band(anchor+em*0.5, '#00CCFF', true);      // ±0.5σ
+            band(anchor-em*0.5, '#00CCFF', true);
+            band(anchor+em,     '#FF8C00', true);      // ±1σ
+            band(anchor-em,     '#FF8C00', true);
+            band(anchor+em*1.5, '#FFEE00', false);     // ±1.5σ
+            band(anchor-em*1.5, '#FFEE00', false);
+            band(anchor+em*2.0, '#FF2244', true);      // ±2σ
+            band(anchor-em*2.0, '#FF2244', true);
         }
 
         // ── Weekly (purple) / monthly (pink) bands ─────────────────────────
@@ -7158,8 +7181,8 @@ function expPlotter(canvas, indicator, history){
         if(!(emM > 0)) emM = EM_MONTHLY;
         const wkA = indicator.weekOpen || 0;
         const moA = indicator.monthOpen || 0;
-        if(wkA > 0 && emW > 0){ span(wkA+emW, '#B388FF', 2, 0.8); span(wkA-emW, '#B388FF', 2, 0.8); }
-        if(moA > 0 && emM > 0){ span(moA+emM, '#FF88DD', 2, 0.7); span(moA-emM, '#FF88DD', 2, 0.7); }
+        if(wkA > 0 && emW > 0){ band(wkA+emW, '#B388FF', false); band(wkA-emW, '#B388FF', false); }
+        if(moA > 0 && emM > 0){ band(moA+emM, '#FF88DD', false); band(moA-emM, '#FF88DD', false); }
     } catch(e){}
 }
 
@@ -7190,6 +7213,10 @@ module.exports = {
         // here. 0 = auto-detect (only approximate on tick charts, so paste
         // the real open). Step 0.25 = NQ tick, so prices like 29902.25 work.
         rthOpen:        predef.paramSpecs.number(0, 0.25, 0),
+        // emZonePts: draw each EM level as a ZONE this many points thick on
+        // each side of the level (a shaded band with edge + center lines),
+        // instead of a thin line. 0 = thin lines. Try 8-20 for NQ.
+        emZonePts:      predef.paramSpecs.number(12, 1, 0),
         // 0 = hide historical fallback sigmas from the chart. They remain
         // available internally, but only true user-entered expected moves
         // draw by default.

@@ -20,3 +20,15 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.0"
+  # 4-market expected-move monitor — ES/NQ/YM/RTY ranked by how far each has
+  # travelled vs its own daily EM, so you can see who's leading. Own URL.
+  # (uvicorn four_em:app)
+  - type: web
+    name: four-market-em
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn four_em:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"

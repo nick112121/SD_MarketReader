@@ -33,24 +33,22 @@ const plottingTools  = require('./tools/plotting');
 // ── CONSTANTS ────────────────────────────────────────────────────────────
 const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast)
 // ╔══════════════════════════════════════════════════════════════════════╗
-// ║  EXPECTED MOVE — PASTE ONE NUMBER EACH MORNING                        ║
+// ║  EXPECTED MOVE — paste numbers from the EM page (in CODE, not the      ║
+// ║  Settings panel; Tradovate does not pass custom settings here).        ║
 // ║                                                                       ║
-// ║  Set EM_DAILY to today's daily expected move (off the EM page). That  ║
-// ║  is the ONLY thing you edit. The indicator does the rest:             ║
-// ║    • daily bands  = open ± EM_DAILY × {0.5, 1, 1.5, 2}                 ║
-// ║    • weekly band  = week-open  ± EM_DAILY × √5   (auto-derived)        ║
-// ║    • monthly band = month-open ± EM_DAILY × √21  (auto-derived)        ║
-// ║    • anchors are auto-detected (daily = 9:30 RTH open)                 ║
-// ║                                                                       ║
-// ║  Edit it HERE in the code, not the Settings panel — Tradovate does    ║
-// ║  not pass custom settings to this indicator.                          ║
-// ║                                                                       ║
-// ║  The three OVERRIDES below are optional; leave them 0 for full auto.  ║
+// ║  Each band is FIXED for its horizon and anchored at that horizon's     ║
+// ║  open, so the levels stay put — the weekly doesn't move with the daily.║
+// ║    EM_DAILY   — update EVERY MORNING. Daily bands = 9:30 open           ║
+// ║                 ± EM_DAILY × {0.5, 1, 1.5, 2}.                          ║
+// ║    EM_WEEKLY  — set ONCE at the start of the week; held all week,       ║
+// ║                 anchored at the week open. 0 = weekly band off.         ║
+// ║    EM_MONTHLY — set ONCE at the start of the month; held all month,     ║
+// ║                 anchored at the month open. 0 = monthly band off.       ║
+// ║  Anchors auto-detect; RTH_OPEN is an optional exact-anchor override.    ║
 // ╚══════════════════════════════════════════════════════════════════════╝
-const EM_DAILY   = 455;  // ← the one number: today's daily expected move (pts)
-// Optional overrides (0 = auto):
-const EM_WEEKLY  = 0;    // 0 = derive from daily ×√5 ; set a number to force it
-const EM_MONTHLY = 0;    // 0 = derive from daily ×√21; set a number to force it
+const EM_DAILY   = 455;  // daily move — update every morning (points)
+const EM_WEEKLY  = 0;    // weekly move — set Mondays, held all week (0 = off)
+const EM_MONTHLY = 0;    // monthly move — set at month start, held (0 = off)
 const RTH_OPEN   = 0;    // 0 = auto-anchor at the 9:30 RTH open; or paste it
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
@@ -1033,15 +1031,13 @@ class MarketReader {
             // Monthly anchor + weekly/monthly expected-move bands (options-implied)
             const _monthKey = wkBase.y+'-'+wkBase.m;
             if(isNewBar && _monthKey!==this.monthKey){ this.monthKey=_monthKey; this.monthOpen=o; this.monthOpenBar=bi; }
-            // Weekly/monthly EM auto-derive from the one daily number
-            // (EM scales with √time: week=√5, month=√21). Overridable.
-            let _emDForBands=(p.expMoveDaily!=null?Number(p.expMoveDaily):0)||0;
-            if(!(_emDForBands>0)) _emDForBands=EM_DAILY;
-            let _emW=(p.expMoveWeekly!=null?Number(p.expMoveWeekly):0)||0;
-            if(!(_emW>0)) _emW = EM_WEEKLY>0 ? EM_WEEKLY : _emDForBands*Math.sqrt(5);
-            let _emM=(p.expMoveMonthly!=null?Number(p.expMoveMonthly):0)||0;
-            if(!(_emM>0)) _emM = EM_MONTHLY>0 ? EM_MONTHLY : _emDForBands*Math.sqrt(21);
+            // Weekly/monthly use their OWN fixed numbers (set once per
+            // week/month) so the bands don't drift as the daily changes.
             // Weekly anchors at the week open, monthly at the month open.
+            let _emW=(p.expMoveWeekly!=null?Number(p.expMoveWeekly):0)||0;
+            if(!(_emW>0)) _emW=EM_WEEKLY;
+            let _emM=(p.expMoveMonthly!=null?Number(p.expMoveMonthly):0)||0;
+            if(!(_emM>0)) _emM=EM_MONTHLY;
             this.wk1H=(this.weekOpen>0&&_emW>0)?this.weekOpen+_emW:0;
             this.wk1L=(this.weekOpen>0&&_emW>0)?this.weekOpen-_emW:0;
             this.mo1H=(this.monthOpen>0&&_emM>0)?this.monthOpen+_emM:0;
@@ -7118,12 +7114,12 @@ function expPlotter(canvas, indicator, history){
         }
 
         // ── Weekly (purple) / monthly (pink) bands ─────────────────────────
-        // Auto-derived from the one daily number (week=×√5, month=×√21) and
-        // anchored at the week open / month open. Overridable via the consts.
+        // Own fixed numbers, anchored at the week open / month open. They
+        // stay put for the whole week/month and don't move with the daily.
         let emW = (indicator.props && Number(indicator.props.expMoveWeekly)) || 0;
-        if(!(emW > 0)) emW = EM_WEEKLY > 0 ? EM_WEEKLY : em*Math.sqrt(5);
+        if(!(emW > 0)) emW = EM_WEEKLY;
         let emM = (indicator.props && Number(indicator.props.expMoveMonthly)) || 0;
-        if(!(emM > 0)) emM = EM_MONTHLY > 0 ? EM_MONTHLY : em*Math.sqrt(21);
+        if(!(emM > 0)) emM = EM_MONTHLY;
         const wkA = indicator.weekOpen || 0;
         const moA = indicator.monthOpen || 0;
         if(wkA > 0 && emW > 0){ span(wkA+emW, '#B388FF', 2, 0.8); span(wkA-emW, '#B388FF', 2, 0.8); }

@@ -1919,8 +1919,11 @@ class MarketReader {
                 // "undefined", Tradovate isn't passing Settings here and the
                 // code constants are the only control. (Temporary readout.)
                 const _sv = (k)=>((this.props&&this.props[k]!=null)?this.props[k]:'undefined');
+                const _pp = this.props;
+                const _ptype = (_pp==null) ? 'NULL/undefined' : (typeof _pp);
+                const _pkeys = (_pp && typeof _pp==='object') ? Object.keys(_pp).length : 0;
                 _items.push({tag:'Text', key:'em_settings_check',
-                    text:'Settings check → D='+_sv('expMoveDaily')+'  W='+_sv('expMoveWeekly')+'  M='+_sv('expMoveMonthly'),
+                    text:'props='+_ptype+' keys='+_pkeys+'  |  D='+_sv('expMoveDaily')+' W='+_sv('expMoveWeekly')+' M='+_sv('expMoveMonthly')+' tz='+_sv('tzOffsetHours'),
                     point:{x:_emLabelX, y:du(c + atr*1.8)},
                     style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FFCC44'},
                     textAlignment:'leftMiddle', global:true});

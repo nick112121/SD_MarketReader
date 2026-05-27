@@ -39,6 +39,13 @@ const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast
 const EM_DAILY   = 200;
 const EM_WEEKLY  = 0;    // optional: weekly 1-sigma in points (0 = off)
 const EM_MONTHLY = 0;    // optional: monthly 1-sigma in points (0 = off)
+// ── RTH OPEN (the price the daily bands anchor to) ────────────────────────
+// EDIT THIS each morning to this morning's 9:30 ET open of NQ (read it off
+// your platform). This is EXACT and works on any chart type — tick or time.
+// Leave at 0 to let the indicator auto-detect the 9:30 open, but on tick
+// charts the auto value is only the open of whichever bar straddles 9:30,
+// so paste the real number here for a correct anchor.
+const RTH_OPEN   = 0;
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
 const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)
@@ -1868,9 +1875,10 @@ class MarketReader {
             // EM_DAILY constant at the top of the file (so bands always draw).
             let _emDLive = (this.props && Number(this.props.expMoveDaily)) || 0;
             if(!(_emDLive > 0)) _emDLive = EM_DAILY;
-            // Match the line anchor: this morning's 9:30 RTH open, with the
-            // current session open / last close only as a cold-start fallback.
-            const _emAnchor = this.rthOpen > 0 ? this.rthOpen
+            // Match the plotter's anchor exactly: pasted RTH_OPEN, else the
+            // auto-detected 9:30 open, else the session open / last close.
+            const _emAnchor = RTH_OPEN > 0    ? RTH_OPEN
+                            : this.rthOpen > 0 ? this.rthOpen
                             : this.sessOpen > 0 ? this.sessOpen : c;
             if(_drawEMFallback && _emDLive > 0){
                 _emLine('em_d_1h', _emAnchor+_emDLive*0.5, '#00CCFF', 2, 1.0, 'D +0.5EM');
@@ -4489,9 +4497,12 @@ class MarketReader {
         // working canvas plotter so the LINES actually draw.
         let emDaily = (this.props && Number(this.props.expMoveDaily)) || 0;
         if(!(emDaily > 0)) emDaily = EM_DAILY;
-        // Anchor the daily bands at this morning's 9:30 RTH open, not the
-        // current (EVE/Asia/London) session open.
-        const anchor = (this.rthOpen > 0) ? this.rthOpen : open;
+        // Anchor the daily bands at this morning's 9:30 RTH open. Prefer the
+        // exact RTH_OPEN you paste in each morning; else the auto-detected
+        // 9:30 open; else fall back to this bar's open.
+        const anchor = (RTH_OPEN > 0)     ? RTH_OPEN
+                     : (this.rthOpen > 0) ? this.rthOpen
+                     : open;
         this.expMid = anchor;
         if(emDaily > 0){
             this.expDailyIsInput = true;
@@ -7053,54 +7064,57 @@ class MarketReader {
 }
 
 function expPlotter(canvas, indicator, history){
+    // Draw the expected-move bands as full-width horizontal levels straight
+    // from the live anchor + EM value. This deliberately does NOT reconstruct
+    // levels by matching per-bar history fields (session id / stored exp
+    // value) — that matching broke whenever the chart was rebuilt (tick-count
+    // change, tick<->time switch), which is why the lines vanished or jumped.
+    // Anchoring off indicator state makes it chart-type-independent.
     try{
-        const cur  = indicator.sessKey;
-        const curH = indicator.exp1H;
-        if(!cur||!curH) return;
+        if(!history || !history.data || history.data.length===0) return;
         const pt = plottingTools;
-        let sx=null, lastX=null;
-        let eH=null,eL=null,eM=null,e2H=null,e2L=null,e3H=null,e3L=null,e4H=null,e4L=null;
+        const first = history.get(0);
+        const last  = history.get(history.data.length-1);
+        if(!first || !last) return;
+        const lx = pt.x.get(first);
+        const rx = pt.x.get(last);
+        if(lx===null || rx===null) return;
+        const ex = pt.x.relative(rx, 3000);
+        const span = (y,color,width,opacity)=>{
+            if(!(y>0)) return;
+            canvas.drawLine(pt.offset(lx,y), pt.offset(ex,y), {color:color,lineWidth:width,opacity:opacity});
+        };
 
-        for(let i=0;i<history.data.length;i++){
-            const it=history.get(i);
-            if(!it) continue;
-            const x=pt.x.get(it); lastX=x;
-            if(it.sessId!==cur||it.expCurH!==curH) continue;
-            if(sx===null) sx=x;
-            if(it.expH  >0) eH =it.expH;
-            if(it.expL  >0) eL =it.expL;
-            if(it.expM  )   eM =it.expM;
-            if(it.exp2H >0) e2H=it.exp2H;
-            if(it.exp2L >0) e2L=it.exp2L;
-            if(it.exp3H >0) e3H=it.exp3H;
-            if(it.exp3L >0) e3L=it.exp3L;
-            if(it.exp4H >0) e4H=it.exp4H;
-            if(it.exp4L >0) e4L=it.exp4L;
+        // ── Daily expected-move bands ──────────────────────────────────────
+        // EM value: the setting if Tradovate passes it, else the EM_DAILY
+        // constant. Anchor: pasted RTH_OPEN, else auto-detected 9:30 open,
+        // else the current session open.
+        let em = (indicator.props && Number(indicator.props.expMoveDaily)) || 0;
+        if(!(em > 0)) em = EM_DAILY;
+        let anchor = RTH_OPEN > 0          ? RTH_OPEN
+                   : indicator.rthOpen > 0 ? indicator.rthOpen
+                   : indicator.sessOpen > 0 ? indicator.sessOpen : 0;
+        if(anchor > 0 && em > 0){
+            span(anchor,         '#00FF88', 1, 0.35);  // 9:30 open
+            span(anchor+em*0.5,  '#00CCFF', 2, 1.0);   // ±0.5σ
+            span(anchor-em*0.5,  '#00CCFF', 2, 1.0);
+            span(anchor+em,      '#FF8C00', 1, 0.85);   // ±1σ
+            span(anchor-em,      '#FF8C00', 1, 0.85);
+            span(anchor+em*1.5,  '#FFEE00', 1, 0.75);   // ±1.5σ
+            span(anchor-em*1.5,  '#FFEE00', 1, 0.75);
+            span(anchor+em*2.0,  '#FF2244', 2, 0.9);    // ±2σ
+            span(anchor-em*2.0,  '#FF2244', 2, 0.9);
         }
-        if(sx===null||!eH) return;
-        const ex=pt.x.relative(lastX||sx, 3000);
-        canvas.drawLine(pt.offset(sx,eH), pt.offset(ex,eH), {color:'#00CCFF',lineWidth:2,opacity:1.0});
-        canvas.drawLine(pt.offset(sx,eL), pt.offset(ex,eL), {color:'#00CCFF',lineWidth:2,opacity:1.0});
-        if(eM) canvas.drawLine(pt.offset(sx,eM), pt.offset(ex,eM), {color:'#00FF88',lineWidth:1,opacity:0.35});
-        if(e2H) canvas.drawLine(pt.offset(sx,e2H), pt.offset(ex,e2H), {color:'#FF8C00',lineWidth:1,opacity:0.85});
-        if(e2L) canvas.drawLine(pt.offset(sx,e2L), pt.offset(ex,e2L), {color:'#FF8C00',lineWidth:1,opacity:0.85});
-        if(e3H) canvas.drawLine(pt.offset(sx,e3H), pt.offset(ex,e3H), {color:'#FFEE00',lineWidth:1,opacity:0.75});
-        if(e3L) canvas.drawLine(pt.offset(sx,e3L), pt.offset(ex,e3L), {color:'#FFEE00',lineWidth:1,opacity:0.75});
-        if(e4H) canvas.drawLine(pt.offset(sx,e4H), pt.offset(ex,e4H), {color:'#FF2244',lineWidth:2,opacity:0.9});
-        if(e4L) canvas.drawLine(pt.offset(sx,e4L), pt.offset(ex,e4L), {color:'#FF2244',lineWidth:2,opacity:0.9});
-        // Weekly (purple) / monthly (pink) expected-move bands at week/month open
-        let wkH=null,wkL=null,wkSx=null, moH=null,moL=null,moSx=null;
-        const curWk=indicator.weekKey, curMo=indicator.monthKey;
-        for(let i=0;i<history.data.length;i++){
-            const it=history.get(i); if(!it) continue;
-            const xx=pt.x.get(it);
-            if(it.weekId===curWk && it.wkH>0){ if(wkSx===null) wkSx=xx; wkH=it.wkH; wkL=it.wkL; }
-            if(it.monthId===curMo && it.moH>0){ if(moSx===null) moSx=xx; moH=it.moH; moL=it.moL; }
-        }
-        if(wkH){ canvas.drawLine(pt.offset(wkSx,wkH),pt.offset(ex,wkH),{color:'#B388FF',lineWidth:2,opacity:0.8});
-                 canvas.drawLine(pt.offset(wkSx,wkL),pt.offset(ex,wkL),{color:'#B388FF',lineWidth:2,opacity:0.8}); }
-        if(moH){ canvas.drawLine(pt.offset(moSx,moH),pt.offset(ex,moH),{color:'#FF88DD',lineWidth:2,opacity:0.7});
-                 canvas.drawLine(pt.offset(moSx,moL),pt.offset(ex,moL),{color:'#FF88DD',lineWidth:2,opacity:0.7}); }
+
+        // ── Weekly (purple) / monthly (pink) bands ─────────────────────────
+        let emW = (indicator.props && Number(indicator.props.expMoveWeekly)) || 0;
+        if(!(emW > 0)) emW = EM_WEEKLY;
+        let emM = (indicator.props && Number(indicator.props.expMoveMonthly)) || 0;
+        if(!(emM > 0)) emM = EM_MONTHLY;
+        const wkA = indicator.weekOpen || 0;
+        const moA = indicator.monthOpen || 0;
+        if(wkA > 0 && emW > 0){ span(wkA+emW, '#B388FF', 2, 0.8); span(wkA-emW, '#B388FF', 2, 0.8); }
+        if(moA > 0 && emM > 0){ span(moA+emM, '#FF88DD', 2, 0.7); span(moA-emM, '#FF88DD', 2, 0.7); }
     } catch(e){}
 }
 

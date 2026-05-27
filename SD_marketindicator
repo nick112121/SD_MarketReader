@@ -33,23 +33,22 @@ const plottingTools  = require('./tools/plotting');
 // ── CONSTANTS ────────────────────────────────────────────────────────────
 const WARM_BARS  = 30;   // bars before trading starts (tick charts warm up fast)
 // ╔══════════════════════════════════════════════════════════════════════╗
-// ║  EXPECTED MOVE — paste numbers from the EM page (in CODE, not the      ║
-// ║  Settings panel; Tradovate does not pass custom settings here).        ║
-// ║                                                                       ║
-// ║  Each band is FIXED for its horizon and anchored at that horizon's     ║
-// ║  open, so the levels stay put — the weekly doesn't move with the daily.║
-// ║    EM_DAILY   — update EVERY MORNING. Daily bands = 9:30 open           ║
-// ║                 ± EM_DAILY × {0.5, 1, 1.5, 2}.                          ║
-// ║    EM_WEEKLY  — set ONCE at the start of the week; held all week,       ║
-// ║                 anchored at the week open. 0 = weekly band off.         ║
-// ║    EM_MONTHLY — set ONCE at the start of the month; held all month,     ║
-// ║                 anchored at the month open. 0 = monthly band off.       ║
-// ║  Anchors auto-detect; RTH_OPEN is an optional exact-anchor override.    ║
+// ║  EXPECTED MOVE — set these in the indicator's SETTINGS panel.          ║
+// ║  (The panel works now — no code editing needed.) Fields:               ║
+// ║    expMoveDaily   — daily move; update every morning. Daily bands =     ║
+// ║                     9:30 open ± value × {0.5, 1, 1.5, 2}.               ║
+// ║    expMoveWeekly  — weekly move; set once at week start (0 = off).      ║
+// ║    expMoveMonthly — monthly move; set once at month start (0 = off).    ║
+// ║    rthOpen        — today's exact 9:30 RTH open price (0 = auto-detect).║
+// ║                                                                        ║
+// ║  The constants below are only a FALLBACK used when the matching        ║
+// ║  Settings field is left at 0. Leave them at 0 to drive everything      ║
+// ║  from the Settings panel.                                              ║
 // ╚══════════════════════════════════════════════════════════════════════╝
-const EM_DAILY   = 455;  // daily move — update every morning (points)
-const EM_WEEKLY  = 1015;  // weekly move — set Mondays, held all week (0 = off)
-const EM_MONTHLY = 0;    // monthly move — set at month start, held (0 = off)
-const RTH_OPEN   = 29902; // today's exact 9:30 RTH open (0 = auto-detect)
+const EM_DAILY   = 0;    // fallback daily move  (0 = use Settings)
+const EM_WEEKLY  = 0;    // fallback weekly move (0 = use Settings / off)
+const EM_MONTHLY = 0;    // fallback monthly move(0 = use Settings / off)
+const RTH_OPEN   = 0;    // fallback 9:30 open   (0 = use Settings / auto)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
 const REPEAT_LOSS_BARS = 60; // block same dir+level re-entry within N bars of a loss (1hr on 1m bars)
@@ -1882,9 +1881,11 @@ class MarketReader {
             // EM_DAILY constant at the top of the file (so bands always draw).
             let _emDLive = (this.props && Number(this.props.expMoveDaily)) || 0;
             if(!(_emDLive > 0)) _emDLive = EM_DAILY;
-            // Match the plotter's anchor exactly: pasted RTH_OPEN, else the
-            // auto-detected 9:30 open, else the session open / last close.
-            const _emAnchor = RTH_OPEN > 0    ? RTH_OPEN
+            // Match the plotter's anchor exactly: Settings rthOpen, else the
+            // RTH_OPEN constant, else the auto 9:30 open, else session/last.
+            const _rthInL = (this.props && Number(this.props.rthOpen)) || 0;
+            const _emAnchor = _rthInL > 0     ? _rthInL
+                            : RTH_OPEN > 0     ? RTH_OPEN
                             : this.rthOpen > 0 ? this.rthOpen
                             : this.sessOpen > 0 ? this.sessOpen : c;
             if(_drawEMFallback && _emDLive > 0){
@@ -1911,19 +1912,10 @@ class MarketReader {
                 _emLine('em_m_1h', this.mo1H, '#FF88DD', 2, 0.7, 'MO +EM');
                 _emLine('em_m_1l', this.mo1L, '#FF88DD', 2, 0.7, 'MO -EM');
             }
-            if(_drawEMFallback){
-                // SETTINGS CHECK — shows exactly what the indicator receives
-                // from the Tradovate Settings panel. If you type values into
-                // Settings and these update to match, you can set everything
-                // in Settings and skip editing the code. If they stay
-                // "undefined", Tradovate isn't passing Settings here and the
-                // code constants are the only control. (Temporary readout.)
-                const _sv = (k)=>((this.props&&this.props[k]!=null)?this.props[k]:'undefined');
-                const _pp = this.props;
-                const _ptype = (_pp==null) ? 'NULL/undefined' : (typeof _pp);
-                const _pkeys = (_pp && typeof _pp==='object') ? Object.keys(_pp).length : 0;
-                _items.push({tag:'Text', key:'em_settings_check',
-                    text:'props='+_ptype+' keys='+_pkeys+'  |  D='+_sv('expMoveDaily')+' W='+_sv('expMoveWeekly')+' M='+_sv('expMoveMonthly')+' tz='+_sv('tzOffsetHours'),
+            if(_drawEMFallback && !(_emDLive > 0)){
+                // Hint shown only when no daily move is set anywhere.
+                _items.push({tag:'Text', key:'em_status_off',
+                    text:'EM off — set expMoveDaily in the Settings panel',
                     point:{x:_emLabelX, y:du(c + atr*1.8)},
                     style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FFCC44'},
                     textAlignment:'leftMiddle', global:true});
@@ -4506,18 +4498,18 @@ class MarketReader {
                       sk.includes('_asia')   ? 175 :
                                                 150;
         const calRange = this.calDayH>0&&this.calDayL<999999 ? this.calDayH-this.calDayL : 0;
-        // Prefer the param if Tradovate passes it; otherwise fall back to the
-        // EM_DAILY constant at the top of the file. Tradovate doesn't reliably
-        // pass custom number params to the calculator, so the constant is what
-        // keeps the bands alive — and keeping emDaily>0 forces the input branch
-        // (expDailyIsInput=true), which is what routes the bands through the
-        // working canvas plotter so the LINES actually draw.
+        // Daily expected move: Settings field first, then the EM_DAILY
+        // fallback constant. Keeping emDaily>0 forces the input branch
+        // (expDailyIsInput=true), which routes the bands through the canvas
+        // plotter so the LINES actually draw.
         let emDaily = (this.props && Number(this.props.expMoveDaily)) || 0;
         if(!(emDaily > 0)) emDaily = EM_DAILY;
-        // Anchor the daily bands at this morning's 9:30 RTH open. Prefer the
-        // exact RTH_OPEN you paste in each morning; else the auto-detected
-        // 9:30 open; else fall back to this bar's open.
-        const anchor = (RTH_OPEN > 0)     ? RTH_OPEN
+        // Anchor the daily bands at the 9:30 RTH open. Settings rthOpen first,
+        // then the RTH_OPEN constant, then the auto-detected open, then this
+        // bar's open.
+        const _rthIn = (this.props && Number(this.props.rthOpen)) || 0;
+        const anchor = (_rthIn > 0)       ? _rthIn
+                     : (RTH_OPEN > 0)     ? RTH_OPEN
                      : (this.rthOpen > 0) ? this.rthOpen
                      : open;
         this.expMid = anchor;
@@ -7108,9 +7100,11 @@ function expPlotter(canvas, indicator, history){
         // else the current session open.
         let em = (indicator.props && Number(indicator.props.expMoveDaily)) || 0;
         if(!(em > 0)) em = EM_DAILY;
-        let anchor = RTH_OPEN > 0          ? RTH_OPEN
-                   : indicator.rthOpen > 0 ? indicator.rthOpen
-                   : indicator.sessOpen > 0 ? indicator.sessOpen : 0;
+        const _rthIn = (indicator.props && Number(indicator.props.rthOpen)) || 0;
+        let anchor = _rthIn > 0              ? _rthIn
+                   : RTH_OPEN > 0            ? RTH_OPEN
+                   : indicator.rthOpen > 0   ? indicator.rthOpen
+                   : indicator.sessOpen > 0  ? indicator.sessOpen : 0;
         if(anchor > 0 && em > 0){
             span(anchor,         '#00FF88', 1, 0.35);  // 9:30 open
             span(anchor+em*0.5,  '#00CCFF', 2, 1.0);   // ±0.5σ
@@ -7160,6 +7154,10 @@ module.exports = {
         expMoveDaily:   predef.paramSpecs.number(0, 1, 0),
         expMoveWeekly:  predef.paramSpecs.number(0, 1, 0),
         expMoveMonthly: predef.paramSpecs.number(0, 1, 0),
+        // rthOpen: today's exact 9:30 RTH open price; the daily bands anchor
+        // here. 0 = auto-detect (only approximate on tick charts, so paste
+        // the real open). Step 0.25 = NQ tick, so prices like 29902.25 work.
+        rthOpen:        predef.paramSpecs.number(0, 0.25, 0),
         // 0 = hide historical fallback sigmas from the chart. They remain
         // available internally, but only true user-entered expected moves
         // draw by default.

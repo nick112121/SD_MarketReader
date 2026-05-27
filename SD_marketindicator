@@ -7141,12 +7141,15 @@ module.exports = {
     ],
     params: {
         tzOffsetHours: predef.paramSpecs.number(-4,1,-12),
-        // Expected-move levels (options-implied). Paste the 1-sigma ATM straddle
-        // in points per horizon. 0 = off (falls back to historical-range sigmas).
-        // Daily drives the sigma bands; weekly/monthly draw their own.
-        expMoveDaily:   predef.paramSpecs.number(200, 25, 0),
-        expMoveWeekly:  predef.paramSpecs.number(0, 25, 0),
-        expMoveMonthly: predef.paramSpecs.number(0, 25, 0),
+        // Expected-move levels (options-implied). Step is 1 so any value
+        // (e.g. 455) is accepted, not just multiples of 25. Default 0: when
+        // left at 0 the bands use the EM_DAILY / EM_WEEKLY / EM_MONTHLY code
+        // constants at the top of the file. NOTE: Tradovate does not reliably
+        // pass these Settings to the indicator, so the code constants are the
+        // guaranteed control — set them there if a Settings change has no effect.
+        expMoveDaily:   predef.paramSpecs.number(0, 1, 0),
+        expMoveWeekly:  predef.paramSpecs.number(0, 1, 0),
+        expMoveMonthly: predef.paramSpecs.number(0, 1, 0),
         // 0 = hide historical fallback sigmas from the chart. They remain
         // available internally, but only true user-entered expected moves
         // draw by default.

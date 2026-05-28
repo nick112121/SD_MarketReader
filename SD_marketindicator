@@ -194,7 +194,9 @@ class MarketReader {
         // State for the interpolated 9:30-open auto-detect (2 completed bars
         // bracketing 9:30, computed once per day).
         this._bar1Close=0; this._bar1Ts=0; this._bar2Close=0; this._bar2Ts=0;
-        this._rthDayKey='';
+        // Day-keys for the 2-stage RTH-open capture (rough + interpolated).
+        this._rthRoughDk=''; this._rthInterpDk='';
+        this._rthDayKey='';   // legacy — kept harmless
         this.calDayKey=''; this.calDayH=0; this.calDayL=999999;
         this.sessRanges=[]; this.avgSessRange=0;
         this.voids=[];
@@ -626,23 +628,37 @@ class MarketReader {
             }
             this._lastBarTs = _curTs;
 
-            // ── AUTO 9:30 RTH OPEN (interpolated) ─────────────────────────
-            // Tick bars don't break at 9:30, so no bar's open IS the 9:30
-            // print. But once the bar that closes just after 9:30 is done,
-            // the two completed bars on either side of 9:30 bracket it — and
-            // linear-interpolating their closes to the 9:30 timestamp gives a
-            // close estimate of the open. Runs once per day; the manual
-            // rthOpen setting (if > 0) overrides this everywhere downstream.
-            if(isNewBar && this._bar1Close > 0 && this._bar2Close > 0){
+            // ── AUTO 9:30 RTH OPEN ────────────────────────────────────────
+            // Two-stage so the anchor never sticks on a prior day's open:
+            //  1) ROUGH CAPTURE — on the first new bar at/after 9:30 today,
+            //     latch its open as a starting anchor. Fires regardless of
+            //     whether the session-transition or interpolation paths fire,
+            //     so a stale yesterday value can't survive into today.
+            //  2) INTERP REFINE — once the two completed bars bracketing 9:30
+            //     are both available, linear-interpolate their closes to the
+            //     exact 9:30 timestamp and overwrite the rough capture for a
+            //     much closer estimate of the actual 9:30 print.
+            // The manual rthOpen Setting (if > 0) overrides both downstream.
+            if(isNewBar){
                 const _open930Adj = Date.UTC(lt.getUTCFullYear(), lt.getUTCMonth(), lt.getUTCDate(), 9, 30, 0, 0);
                 const _tCross = _open930Adj - tz*3600000;
                 const _dk = lt.getUTCFullYear()+'-'+(lt.getUTCMonth()+1)+'-'+lt.getUTCDate();
-                if(this._rthDayKey !== _dk && this._bar2Ts < _tCross && _tCross <= this._bar1Ts){
+                const _minOfDay = bLth*60 + bLtm;
+                // Step 1 — rough capture on the first post-9:30 bar of the day.
+                if(_minOfDay >= 570 && this._rthRoughDk !== _dk){
+                    this.rthOpen    = o;
+                    this.rthOpenBar = this.barIdx;
+                    this._rthRoughDk = _dk;
+                }
+                // Step 2 — interpolated refinement when the bracket is available.
+                if(this._rthInterpDk !== _dk
+                   && this._bar1Close > 0 && this._bar2Close > 0
+                   && this._bar2Ts < _tCross && _tCross <= this._bar1Ts){
                     const _span = this._bar1Ts - this._bar2Ts;
                     const _f = _span > 0 ? (_tCross - this._bar2Ts) / _span : 0;
-                    this.rthOpen = this._bar2Close + (this._bar1Close - this._bar2Close) * _f;
+                    this.rthOpen    = this._bar2Close + (this._bar1Close - this._bar2Close) * _f;
                     this.rthOpenBar = this.barIdx;
-                    this._rthDayKey = _dk;
+                    this._rthInterpDk = _dk;
                 }
             }
 

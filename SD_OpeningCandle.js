@@ -1,26 +1,30 @@
 'use strict';
 // ═══════════════════════════════════════════════════════════════════════
-// SD_OpeningCandle  —  Session Open / "Fair Price" candle marker
+// SD_OpeningCandle  —  Session "Fair Price" candle marker (time charts)
 //
 // Built from the "high time-frame reversion, low time-frame continuation"
-// prop-firm strategy. The core idea from the strategy:
+// prop-firm strategy:
 //
-//   "I always mark out the candle pre-open / the opening candle, which we
-//    believe is the fair price. Any move away from that is unfair."
+//   "I always mark out the candle pre-open, which we believe is the fair
+//    price. Any move away from that is unfair."
 //
-// At each session open the price right at the open is treated as the fair
-// auction price. This indicator finds the FIRST candle at/after each
-// session open and:
-//   • draws a box anchored on that candle, extended to the right
-//     (top = candle high, bottom = candle low) — the fair-value zone
-//   • draws a "fair price" line at the candle's OPEN (== the pre-open
-//     close, the level the YouTuber reverts back to)
-//   • labels it with the session name + fair price
+// By default it marks the TWO candles that strategy revolves around:
+//   • NY  09:29 — the candle just BEFORE the 09:30 RTH open. Its CLOSE is
+//                 the fair price (== the 09:30 open).
+//   • EVE 18:00 — the 6 PM reopen candle. Its OPEN is the fair price.
 //
-// Sessions (times are wall-clock in the configured tz; default -4 = US
-// Eastern / EDT). Toggle each on/off in the params panel:
-//   NEWS  08:30   NY    09:30   NY PM 14:00
-//   EVE   18:00   ASIA  20:00   LON   03:00
+// For each marked candle it draws:
+//   • a box anchored on the candle, extended right (top = high, bot = low)
+//   • a "fair price" line (the candle's close for pre-open candles, its
+//     open for reopen candles) — the level the strategy reverts back to
+//   • a label with the session name + fair price
+//
+// Extra optional sessions (off by default) can be toggled in the params:
+//   NEWS 08:29   NY PM 13:59   ASIA 20:00   LON 03:00
+//
+// Use on a TIME-based chart (1m recommended, as in the strategy). On a 1m
+// chart the 09:29 / 18:00 candles line up exactly; on higher timeframes
+// the nearest candle within openToleranceMin is used.
 //
 // tzOffsetHours: shift the bar timestamp to your exchange wall clock.
 //   -4 = US Eastern during DST (EDT, the default — matches the strategy's
@@ -44,16 +48,18 @@ class OpeningCandleMarker {
         this._seen = {};           // "dayKey|SESS" -> index into this.opens
     }
 
-    // Session table. min = minutes from local midnight for the open.
+    // Session table. min = minutes from local midnight for the candle to
+    // mark. fairAt = which price of that candle is the "fair price" line
+    // ('close' for pre-open candles, 'open' for reopen candles).
     _sessions() {
         const p = this.props || {};
         return [
-            { key: 'NEWS', label: 'NEWS 8:30',  min:  8 * 60 + 30, on: pget(p, 'sessNewsAM',  1), color: '#FF8C00' },
-            { key: 'NY',   label: 'NY 9:30',    min:  9 * 60 + 30, on: pget(p, 'sessNY',      1), color: '#00CCFF', primary: true },
-            { key: 'NYPM', label: 'NY PM 2:00', min: 14 * 60,      on: pget(p, 'sessNYPM',    1), color: '#FF55DD' },
-            { key: 'EVE',  label: 'EVE 6:00',   min: 18 * 60,      on: pget(p, 'sessEvening', 0), color: '#88AAFF' },
-            { key: 'ASIA', label: 'ASIA 8:00',  min: 20 * 60,      on: pget(p, 'sessAsia',    0), color: '#FFD24D' },
-            { key: 'LON',  label: 'LON 3:00',   min:  3 * 60,      on: pget(p, 'sessLondon',  0), color: '#A0FF88' },
+            { key: 'NY',   label: 'NY 9:29',    min:  9 * 60 + 29, fairAt: 'close', on: pget(p, 'sessNY',      1), color: '#00CCFF', primary: true },
+            { key: 'EVE',  label: 'EVE 6:00',   min: 18 * 60,      fairAt: 'open',  on: pget(p, 'sessEvening', 1), color: '#88AAFF' },
+            { key: 'NEWS', label: 'NEWS 8:29',  min:  8 * 60 + 29, fairAt: 'close', on: pget(p, 'sessNewsAM',  0), color: '#FF8C00' },
+            { key: 'NYPM', label: 'NY PM 1:59', min: 13 * 60 + 59, fairAt: 'close', on: pget(p, 'sessNYPM',    0), color: '#FF55DD' },
+            { key: 'ASIA', label: 'ASIA 8:00',  min: 20 * 60,      fairAt: 'open',  on: pget(p, 'sessAsia',    0), color: '#FFD24D' },
+            { key: 'LON',  label: 'LON 3:00',   min:  3 * 60,      fairAt: 'open',  on: pget(p, 'sessLondon',  0), color: '#A0FF88' },
         ];
     }
 
@@ -108,7 +114,7 @@ class OpeningCandleMarker {
                 if (diff >= 0 && diff <= tol) {
                     this._seen[k] = this.opens.length;
                     this.opens.push({
-                        key: s.key, label: s.label, color: s.color,
+                        key: s.key, label: s.label, color: s.color, fairAt: s.fairAt,
                         primary: !!s.primary, chartIdx, o, h, l, c, dayKey
                     });
                 }
@@ -165,11 +171,13 @@ class OpeningCandleMarker {
                 });
             }
 
-            // Fair price line (the candle's OPEN == pre-open close).
+            // Fair price line. Pre-open candle -> its CLOSE (== the session
+            // open price). Reopen candle -> its OPEN.
+            const fair = (rec.fairAt === 'close') ? rec.c : rec.o;
             if (showFair) {
                 items.push({
                     tag: 'LineSegments', key: 'oc_f_' + rec.key + '_' + rec.dayKey,
-                    lines: [{ tag: 'Line', a: { x: du(sx), y: du(rec.o) }, b: { x: du(ex), y: du(rec.o) } }],
+                    lines: [{ tag: 'Line', a: { x: du(sx), y: du(fair) }, b: { x: du(ex), y: du(fair) } }],
                     lineStyle: { lineWidth: fairLw, color: rec.color, opacity: op }
                 });
             }
@@ -179,7 +187,7 @@ class OpeningCandleMarker {
                 const pad = Math.max(rec.h - rec.l, Math.abs(rec.c) * 0.0003);
                 items.push({
                     tag: 'Text', key: 'oc_lbl_' + rec.key + '_' + rec.dayKey,
-                    text: rec.label + '  fair ' + rec.o.toFixed(2),
+                    text: rec.label + '  fair ' + fair.toFixed(2),
                     point: { x: du(sx), y: du(rec.h + pad) },
                     style: { fontSize: labelSize, fontWeight: rec.primary ? 'bold' : 'normal', fill: rec.color },
                     textAlignment: 'leftMiddle'
@@ -199,21 +207,22 @@ module.exports = {
         // Shift bar timestamps to your exchange wall clock.
         // -4 = US Eastern (EDT). Use -5 for true winter EST.
         tzOffsetHours: predef.paramSpecs.number(-4, 1, -12),
-        // Session toggles (1 = mark its open candle, 0 = ignore).
-        sessNewsAM:  predef.paramSpecs.number(1, 1, 0),   // 08:30 news
-        sessNY:      predef.paramSpecs.number(1, 1, 0),   // 09:30 NY open
-        sessNYPM:    predef.paramSpecs.number(1, 1, 0),   // 14:00 NY PM
-        sessEvening: predef.paramSpecs.number(0, 1, 0),   // 18:00 reopen
+        // Session toggles (1 = mark that candle, 0 = ignore). Defaults mark
+        // the two candles the strategy uses: 09:29 pre-open and 18:00 reopen.
+        sessNY:      predef.paramSpecs.number(1, 1, 0),   // 09:29 NY pre-open
+        sessEvening: predef.paramSpecs.number(1, 1, 0),   // 18:00 reopen
+        sessNewsAM:  predef.paramSpecs.number(0, 1, 0),   // 08:29 pre-news
+        sessNYPM:    predef.paramSpecs.number(0, 1, 0),   // 13:59 NY PM pre-open
         sessAsia:    predef.paramSpecs.number(0, 1, 0),   // 20:00 Asia
         sessLondon:  predef.paramSpecs.number(0, 1, 0),   // 03:00 London
-        // How many minutes after an open the first bar may be and still
-        // count as that session's open candle. Keep below 60 so the 08:30
-        // news open never bleeds onto the 09:30 NY bar. 1-5m charts: 15 is
-        // plenty; raise only for larger timeframes.
+        // How many minutes after the target the first bar may be and still
+        // count as that candle. On a 1m chart the target candle is exact
+        // (diff 0); the tolerance only matters on gappy / higher-TF charts.
+        // Keep below 60 so adjacent sessions never bleed together.
         openToleranceMin: predef.paramSpecs.number(15, 1, 0),
         // What to draw.
         showZone:     predef.paramSpecs.number(1, 1, 0),  // high/low rectangle
-        showFairLine: predef.paramSpecs.number(1, 1, 0),  // open / fair price line
+        showFairLine: predef.paramSpecs.number(1, 1, 0),  // fair price line
         showLabel:    predef.paramSpecs.number(1, 1, 0),
         // 0 = extend each box until the next session open (or the live bar).
         // >0 = cap the box width at this many bars.

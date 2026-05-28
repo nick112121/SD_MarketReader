@@ -1917,7 +1917,7 @@ class MarketReader {
                     lines:[{tag:'Line', a:{x:du(_emLeft), y:du(y)}, b:{x:du(_emRight), y:du(y)}}],
                     lineStyle:{lineWidth:width, color:color, opacity:opacity}});
                 if(label){
-                    _items.push({tag:'Text', key:key+'_lbl', text:label+' '+y.toFixed(0),
+                    _items.push({tag:'Text', key:key+'_lbl', text:label+' '+y.toFixed(2),
                         point:{x:_emLabelX, y:du(y)},
                         style:{fontSize:_fz(10), fontWeight:'bold', fill:color},
                         textAlignment:'leftMiddle', global:true});
@@ -3753,12 +3753,12 @@ class MarketReader {
                     // Nearest 2 sigma labels — minimal price context
                     if(this.exp1H>0 && (this.expDailyIsInput || showFallbackSigmas)){
                         const sigs = [
-                            {p:this.exp1H, t:'1σH '+this.exp1H.toFixed(0), c:'#00CCFF'},
-                            {p:this.exp1L, t:'1σL '+this.exp1L.toFixed(0), c:'#00CCFF'},
-                            {p:this.exp2H, t:'2σH '+this.exp2H.toFixed(0), c:'#FF8C00'},
-                            {p:this.exp2L, t:'2σL '+this.exp2L.toFixed(0), c:'#FF8C00'},
-                            {p:this.exp3H, t:'3σH '+this.exp3H.toFixed(0), c:'#FFEE00'},
-                            {p:this.exp3L, t:'3σL '+this.exp3L.toFixed(0), c:'#FFEE00'}
+                            {p:this.exp1H, t:'1σH '+this.exp1H.toFixed(2), c:'#00CCFF'},
+                            {p:this.exp1L, t:'1σL '+this.exp1L.toFixed(2), c:'#00CCFF'},
+                            {p:this.exp2H, t:'2σH '+this.exp2H.toFixed(2), c:'#FF8C00'},
+                            {p:this.exp2L, t:'2σL '+this.exp2L.toFixed(2), c:'#FF8C00'},
+                            {p:this.exp3H, t:'3σH '+this.exp3H.toFixed(2), c:'#FFEE00'},
+                            {p:this.exp3L, t:'3σL '+this.exp3L.toFixed(2), c:'#FFEE00'}
                         ].sort((a,b)=>Math.abs(c-a.p)-Math.abs(c-b.p)).slice(0,2);
                         for(let i=0;i<sigs.length;i++){
                             const s = sigs[i];
@@ -3775,21 +3775,21 @@ class MarketReader {
                     // the plotter lines: weekly = purple, monthly = pink). Only
                     // shown when that horizon's EM is set (>0).
                     if(this.wk1H>0){
-                        _items.push({tag:'Text', key:'sm_wkH', text:'WK +EM '+this.wk1H.toFixed(0),
+                        _items.push({tag:'Text', key:'sm_wkH', text:'WK +EM '+this.wk1H.toFixed(2),
                             point:{x:_px, y:du(this.wk1H)},
                             style:{fontSize:_fz(10), fontWeight:'bold', fill:'#B388FF'},
                             textAlignment:'leftMiddle', global:true});
-                        _items.push({tag:'Text', key:'sm_wkL', text:'WK -EM '+this.wk1L.toFixed(0),
+                        _items.push({tag:'Text', key:'sm_wkL', text:'WK -EM '+this.wk1L.toFixed(2),
                             point:{x:_px, y:du(this.wk1L)},
                             style:{fontSize:_fz(10), fontWeight:'bold', fill:'#B388FF'},
                             textAlignment:'leftMiddle', global:true});
                     }
                     if(this.mo1H>0){
-                        _items.push({tag:'Text', key:'sm_moH', text:'MO +EM '+this.mo1H.toFixed(0),
+                        _items.push({tag:'Text', key:'sm_moH', text:'MO +EM '+this.mo1H.toFixed(2),
                             point:{x:_px, y:du(this.mo1H)},
                             style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FF88DD'},
                             textAlignment:'leftMiddle', global:true});
-                        _items.push({tag:'Text', key:'sm_moL', text:'MO -EM '+this.mo1L.toFixed(0),
+                        _items.push({tag:'Text', key:'sm_moL', text:'MO -EM '+this.mo1L.toFixed(2),
                             point:{x:_px, y:du(this.mo1L)},
                             style:{fontSize:_fz(10), fontWeight:'bold', fill:'#FF88DD'},
                             textAlignment:'leftMiddle', global:true});
@@ -4029,14 +4029,14 @@ class MarketReader {
 
                 // Sigma bands — ALWAYS visible (lines drawn by expPlotter)
                 if(this.exp1H>0 && (this.expDailyIsInput || showFallbackSigmas)){
-                    allLvls.push({p:this.exp1H, f:'#00CCFF', s:11, b:false, t:'1σH '+this.exp1H.toFixed(0), always:true});
-                    allLvls.push({p:this.exp1L, f:'#00CCFF', s:11, b:false, t:'1σL '+this.exp1L.toFixed(0), always:true});
-                    allLvls.push({p:this.exp2H, f:'#FF8C00', s:10, b:false, t:'2σH '+this.exp2H.toFixed(0), always:true});
-                    allLvls.push({p:this.exp2L, f:'#FF8C00', s:10, b:false, t:'2σL '+this.exp2L.toFixed(0), always:true});
-                    allLvls.push({p:this.exp3H, f:'#FFEE00', s:10, b:false, t:'3σH '+this.exp3H.toFixed(0), always:true});
-                    allLvls.push({p:this.exp3L, f:'#FFEE00', s:10, b:false, t:'3σL '+this.exp3L.toFixed(0), always:true});
-                    allLvls.push({p:this.exp4H, f:'#FF2244', s:11, b:true,  t:'4σH '+this.exp4H.toFixed(0), always:true});
-                    allLvls.push({p:this.exp4L, f:'#FF2244', s:11, b:true,  t:'4σL '+this.exp4L.toFixed(0), always:true});
+                    allLvls.push({p:this.exp1H, f:'#00CCFF', s:11, b:false, t:'1σH '+this.exp1H.toFixed(2), always:true});
+                    allLvls.push({p:this.exp1L, f:'#00CCFF', s:11, b:false, t:'1σL '+this.exp1L.toFixed(2), always:true});
+                    allLvls.push({p:this.exp2H, f:'#FF8C00', s:10, b:false, t:'2σH '+this.exp2H.toFixed(2), always:true});
+                    allLvls.push({p:this.exp2L, f:'#FF8C00', s:10, b:false, t:'2σL '+this.exp2L.toFixed(2), always:true});
+                    allLvls.push({p:this.exp3H, f:'#FFEE00', s:10, b:false, t:'3σH '+this.exp3H.toFixed(2), always:true});
+                    allLvls.push({p:this.exp3L, f:'#FFEE00', s:10, b:false, t:'3σL '+this.exp3L.toFixed(2), always:true});
+                    allLvls.push({p:this.exp4H, f:'#FF2244', s:11, b:true,  t:'4σH '+this.exp4H.toFixed(2), always:true});
+                    allLvls.push({p:this.exp4L, f:'#FF2244', s:11, b:true,  t:'4σL '+this.exp4L.toFixed(2), always:true});
                 }
 
                 // VWAP — always

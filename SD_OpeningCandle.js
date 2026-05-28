@@ -21,8 +21,9 @@
 //       (B setups) are skipped.
 //       Fixed risk: tpPoints / slPoints (default 38 / 25 = ~1:1.5 R:R,
 //       NQ points). Each entry is tracked to TP or SL and marked WIN/LOSS.
-//       Capped at maxTradesPerSession; window ends 90 min after open
-//       (== 11:00 for NY, matching "stop looking after 11am").
+//       Capped per phase (default 1 continuation + 4 reversion); window
+//       ends 90 min after open (== 11:00 for NY, "stop looking after 11").
+//       New entries also stop once volume dies out (volDieFrac).
 //
 // TIMEFRAME: use a 1-minute time chart (the strategy's primary), 5-minute
 //   for quiet sessions. The chart timeframe is a Tradovate chart setting,
@@ -59,7 +60,7 @@ class OpeningCandleStrategy {
         this._lastClose = null;
         this._lastHigh = null;
         // bar store (timestamp-keyed so replays/ticks never corrupt it)
-        this.O = []; this.H = []; this.L = []; this.C = [];
+        this.O = []; this.H = []; this.L = []; this.C = []; this.V = [];
         this.M = []; this.X = []; this.DK = [];
         this._tsIndex = new Map();
         this._procUpTo = -1;       // last fully-closed bar index processed
@@ -98,6 +99,7 @@ class OpeningCandleStrategy {
             const strat = pget(p, 'enableStrategy', 1);
 
             const o = d.open(), h = d.high(), l = d.low(), c = d.close();
+            const vol = Math.max(0, (typeof d.volume === 'function' ? d.volume() : 0) || 0);
             const chartIdx = (typeof d.index === 'function') ? d.index() : this._bi;
             this._bi++;
             this.lastChartIdx = chartIdx;
@@ -141,10 +143,10 @@ class OpeningCandleStrategy {
             if (k == null) {
                 k = this.O.length;
                 this._tsIndex.set(tms, k);
-                this.O.push(o); this.H.push(h); this.L.push(l); this.C.push(c);
+                this.O.push(o); this.H.push(h); this.L.push(l); this.C.push(c); this.V.push(vol);
                 this.M.push(mins); this.X.push(chartIdx); this.DK.push(dayKey);
             } else {
-                this.O[k] = o; this.H[k] = h; this.L[k] = l; this.C[k] = c;
+                this.O[k] = o; this.H[k] = h; this.L[k] = l; this.C[k] = c; this.V[k] = vol;
                 this.M[k] = mins; this.X[k] = chartIdx; this.DK[k] = dayKey;
             }
 
@@ -167,6 +169,8 @@ class OpeningCandleStrategy {
         const tol = Math.max(0, pget(p, 'openToleranceMin', 15));
         const contMin = pget(p, 'contMinutes', 10);
         const revMin = pget(p, 'revMinutes', 90);
+        const volDieFrac = pget(p, 'volDieFrac', 0.4);
+        const volWindow = Math.max(2, pget(p, 'volWindow', 5));
 
         // 1. manage open position
         if (this.pos !== 0) this._checkExit(k);
@@ -183,7 +187,8 @@ class OpeningCandleStrategy {
                 this.active = {
                     key: s.key, label: s.label, color: s.color,
                     fair: this.O[k], openDir: sgn(this.C[k] - this.O[k]),
-                    openMin, startK: k, trades: 0
+                    openMin, startK: k, contTrades: 0, revTrades: 0,
+                    volSum: 0, volN: 0, volDead: false
                 };
             }
         }
@@ -191,15 +196,33 @@ class OpeningCandleStrategy {
         // 3. close session window after revMin
         if (this.active && this.M[k] > this.active.openMin + revMin) this.active = null;
 
-        // 4. entry
+        // 4. volume tracking — flag "volume died" once it fades vs the
+        //    session average (only after the continuation window).
+        if (this.active) {
+            this.active.volSum += this.V[k];
+            this.active.volN++;
+            if (!this.active.volDead && this.active.volN >= 15 && this.M[k] > this.active.openMin + contMin) {
+                const recent = this._volAvg(k, volWindow);
+                const avg = this.active.volSum / this.active.volN;
+                if (avg > 0 && recent < volDieFrac * avg) this.active.volDead = true;
+            }
+        }
+
+        // 5. entry
         if (this.pos === 0 && this.active && k > this.active.startK) this._maybeEnter(k, contMin, revMin);
+    }
+
+    // Average volume over the `n` bars preceding (and excluding) bar k.
+    _volAvg(k, n) {
+        let sum = 0, cnt = 0;
+        for (let j = Math.max(0, k - n); j <= k - 1; j++) { sum += this.V[j]; cnt++; }
+        return cnt ? sum / cnt : 0;
     }
 
     _maybeEnter(k, contMin, revMin) {
         const p = this.props || {};
-        const maxTrades = pget(p, 'maxTradesPerSession', 5);
         const revMove = pget(p, 'revMinMovePts', 10);
-        if (this.active.trades >= maxTrades) return;
+        if (this.active.volDead) return;               // volume died -> stop trading
 
         const trig = this._trigger(k);
         if (!trig) return;
@@ -215,6 +238,17 @@ class OpeningCandleStrategy {
         }
         if (bias === 0 || trig.dir !== bias) return;  // no bias / B setup -> skip
 
+        // per-phase trade caps: 1 continuation, then 3-4 reversions
+        const maxCont = pget(p, 'maxContTrades', 1), maxRev = pget(p, 'maxRevTrades', 4);
+        if (phase === 'C' && this.active.contTrades >= maxCont) return;
+        if (phase === 'R' && this.active.revTrades >= maxRev) return;
+
+        // optional: require a volume spike to confirm the trigger
+        if (pget(p, 'requireVolSpike', 0)) {
+            const ra = this._volAvg(k, Math.max(2, pget(p, 'volWindow', 5)));
+            if (ra > 0 && this.V[k] < pget(p, 'volSpikeMult', 1.2) * ra) return;
+        }
+
         const tp = pget(p, 'tpPoints', 38), sl = pget(p, 'slPoints', 25);
         this.pos = trig.dir;
         this.entryPx = this.C[k];
@@ -223,7 +257,7 @@ class OpeningCandleStrategy {
         this.sl = this.entryPx - trig.dir * sl;
         this.entryIdx = this.X[k];
         this.entryGrade = trig.grade;
-        this.active.trades++;
+        if (phase === 'C') this.active.contTrades++; else this.active.revTrades++;
         this.entriesLog.push({
             x: this.X[k], dir: trig.dir, grade: trig.grade, phase,
             price: this.entryPx, lo: this.L[k], hi: this.H[k],
@@ -267,7 +301,9 @@ class OpeningCandleStrategy {
             else if (this.L[k] <= this.tp) win = true;
         }
         if (win != null) {
-            this.exitsLog.push({ x: this.X[k], win, price: win ? this.tp : this.sl });
+            const exitPx = win ? this.tp : this.sl;
+            const pts = dir * (exitPx - this.entryPx);
+            this.exitsLog.push({ x: this.X[k], win, price: exitPx, pts });
             this.pos = 0;
         }
     }
@@ -374,14 +410,22 @@ class OpeningCandleStrategy {
         const baseY = (this._lastHigh || this._lastClose || 0);
         const pad = Math.abs(this._lastClose || 1) * 0.0018;
         const wins = this.exitsLog.filter(e => e.win).length;
-        const losses = this.exitsLog.length - wins;
+        const total = this.exitsLog.length;
+        const losses = total - wins;
+        const net = this.exitsLog.reduce((a, e) => a + (e.pts || 0), 0);
+        const wr = total ? Math.round(100 * wins / total) : 0;
+        const perf = 'W' + wins + '/L' + losses + (total ? ' ' + wr + '%' : '') +
+                     '  ' + (net >= 0 ? '+' : '') + net.toFixed(0) + 'pt';
         let line;
         if (this.active) {
-            const max = pget(p, 'maxTradesPerSession', 5);
-            line = this.active.label.split(' ')[0] + '  trades ' + this.active.trades + '/' + max +
-                   '  fair ' + this.active.fair.toFixed(0) + '  W' + wins + '/L' + losses;
+            const maxCont = pget(p, 'maxContTrades', 1), maxRev = pget(p, 'maxRevTrades', 4);
+            line = this.active.label.split(' ')[0] +
+                   '  C' + this.active.contTrades + '/' + maxCont +
+                   ' R' + this.active.revTrades + '/' + maxRev +
+                   (this.active.volDead ? ' [vol died]' : '') +
+                   '  fair ' + this.active.fair.toFixed(0) + '  ' + perf;
         } else {
-            line = 'no active session  W' + wins + '/L' + losses;
+            line = 'no active session  ' + perf;
         }
         items.push({ tag: 'Text', key: 'st_hud',
             text: line, point: { x: du(this.lastChartIdx), y: du(baseY + pad * 2.4) },
@@ -440,13 +484,24 @@ module.exports = {
         // ── strategy logic ──
         contMinutes: predef.paramSpecs.number(10, 1, 0),    // continuation window after open
         revMinutes:  predef.paramSpecs.number(90, 5, 0),    // reversion window after open
-        maxTradesPerSession: predef.paramSpecs.number(5, 1, 1),
+        maxContTrades: predef.paramSpecs.number(1, 1, 0),   // continuation = "the first trade"
+        maxRevTrades:  predef.paramSpecs.number(4, 1, 0),   // reversion = "3-4 trades max"
         bosLookback: predef.paramSpecs.number(12, 1, 2),    // bars for break-of-structure
         dispBodyFrac: predef.paramSpecs.number(0.6, 0.05, 0.1), // displacement body/range
         revMinMovePts: predef.paramSpecs.number(10, 1, 0),  // min move from fair to fade
         // fixed risk in points (NQ). 38/25 ≈ 1:1.5 R:R.
         tpPoints: predef.paramSpecs.number(38, 1, 1),
         slPoints: predef.paramSpecs.number(25, 1, 1),
+
+        // ── volume ("stop looking when volume dies out") ──
+        // Once the recent volume (last volWindow bars) drops below volDieFrac
+        // of the session average, new entries stop. 0 disables.
+        volDieFrac:  predef.paramSpecs.number(0.4, 0.05, 0),
+        volWindow:   predef.paramSpecs.number(5, 1, 2),
+        // optional: require the trigger bar's volume > volSpikeMult * recent
+        // average ("we get the volume spike, close above the box").
+        requireVolSpike: predef.paramSpecs.number(0, 1, 0),
+        volSpikeMult:    predef.paramSpecs.number(1.2, 0.1, 1),
 
         // ── appearance ──
         showZone:      predef.paramSpecs.number(1, 1, 0),

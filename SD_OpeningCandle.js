@@ -138,21 +138,20 @@ class OpeningCandleStrategy {
                 }
             }
 
-            // ── bar store (dedup by timestamp) ──
-            let k = this._tsIndex.get(tms);
-            if (k == null) {
-                k = this.O.length;
-                this._tsIndex.set(tms, k);
-                this.O.push(o); this.H.push(h); this.L.push(l); this.C.push(c); this.V.push(vol);
-                this.M.push(mins); this.X.push(chartIdx); this.DK.push(dayKey);
-            } else {
-                this.O[k] = o; this.H[k] = h; this.L[k] = l; this.C[k] = c; this.V[k] = vol;
-                this.M[k] = mins; this.X[k] = chartIdx; this.DK[k] = dayKey;
-            }
-
-            // ── strategy: step every newly-closed bar (last bar is forming) ──
+            // ── strategy: maintain bar store + step closed bars. Skipped
+            //    entirely when the strategy is off (markers-only mode). ──
             if (strat) {
-                const lastClosed = this.O.length - 2;
+                let k = this._tsIndex.get(tms);
+                if (k == null) {
+                    k = this.O.length;
+                    this._tsIndex.set(tms, k);
+                    this.O.push(o); this.H.push(h); this.L.push(l); this.C.push(c); this.V.push(vol);
+                    this.M.push(mins); this.X.push(chartIdx); this.DK.push(dayKey);
+                } else {
+                    this.O[k] = o; this.H[k] = h; this.L[k] = l; this.C[k] = c; this.V[k] = vol;
+                    this.M[k] = mins; this.X[k] = chartIdx; this.DK[k] = dayKey;
+                }
+                const lastClosed = this.O.length - 2;   // last bar is still forming
                 for (let j = this._procUpTo + 1; j <= lastClosed; j++) this._step(j);
                 if (lastClosed > this._procUpTo) this._procUpTo = lastClosed;
             }

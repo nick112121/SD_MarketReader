@@ -36,6 +36,7 @@
 
 const predef = require('./tools/predef');
 const { du } = require('./tools/graphics');
+const plottingTools = require('./tools/plotting');
 
 function pget(p, key, def) { return (p && p[key] != null) ? p[key] : def; }
 function sgn(x) { return x > 0 ? 1 : (x < 0 ? -1 : 0); }
@@ -119,6 +120,10 @@ class OpeningCandleStrategy {
             this._prevTs = tms;
 
             // ── marker: mark each session's fair-price candle ──
+            // Lines are drawn by the custom plotter (Tradovate's default
+            // renderer ignores line shapes returned from map), so each
+            // opening-candle bar carries its box geometry as fields the
+            // plotter reads back off history.
             const tol = Math.max(0, pget(p, 'openToleranceMin', 15));
             if (markers) {
                 for (const s of this._sessions()) {
@@ -127,13 +132,19 @@ class OpeningCandleStrategy {
                     const seenIdx = this._seen[k];
                     if (seenIdx != null) {
                         const rec = this.opens[seenIdx];
-                        if (rec && rec.chartIdx === chartIdx) { rec.h = Math.max(rec.h, h); rec.l = Math.min(rec.l, l); rec.c = c; }
+                        if (rec && rec.chartIdx === chartIdx) {
+                            rec.h = Math.max(rec.h, h); rec.l = Math.min(rec.l, l); rec.c = c;
+                            _ret.ocKey = s.key; _ret.ocColor = s.color; _ret.ocH = rec.h; _ret.ocL = rec.l;
+                            _ret.ocFair = (s.fairAt === 'close') ? rec.c : rec.o;
+                        }
                         continue;
                     }
                     const diff = mins - s.min;
                     if (diff >= 0 && diff <= tol) {
                         this._seen[k] = this.opens.length;
                         this.opens.push({ key: s.key, label: s.label, color: s.color, fairAt: s.fairAt, primary: !!s.primary, chartIdx, o, h, l, c, dayKey });
+                        _ret.ocKey = s.key; _ret.ocColor = s.color; _ret.ocH = h; _ret.ocL = l;
+                        _ret.ocFair = (s.fairAt === 'close') ? c : o;
                     }
                 }
             }
@@ -316,49 +327,18 @@ class OpeningCandleStrategy {
         if (pget(p, 'tfWarning', 1)) this._drawTF(items, p);
     }
 
+    // Labels only — the box/fair lines are drawn by the custom plotter.
     _drawMarkers(items, p) {
-        const showZone = pget(p, 'showZone', 1);
-        const showFair = pget(p, 'showFairLine', 1);
-        const showLabel = pget(p, 'showLabel', 1);
-        const extendBars = pget(p, 'extendBars', 0);
-        const lw = Math.max(1, pget(p, 'lineWidth', 1));
-        const op = Math.max(0.1, Math.min(1, pget(p, 'opacity', 0.85)));
+        if (!pget(p, 'showLabel', 1)) return;
         const labelSize = Math.max(7, pget(p, 'labelSize', 11));
-
-        for (let i = 0; i < this.opens.length; i++) {
-            const rec = this.opens[i];
-            const next = this.opens[i + 1];
-            const sx = rec.chartIdx;
-            let ex = next ? next.chartIdx : (this.lastChartIdx + 5);
-            if (extendBars > 0) ex = Math.min(ex, sx + extendBars);
-            if (ex <= sx) ex = sx + 1;
-            const zlw = rec.primary ? lw + 1 : lw;
-
-            if (showZone) {
-                items.push({ tag: 'LineSegments', key: 'oc_t_' + rec.key + '_' + rec.dayKey,
-                    lines: [{ tag: 'Line', a: { x: du(sx), y: du(rec.h) }, b: { x: du(ex), y: du(rec.h) } }],
-                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op * 0.6 } });
-                items.push({ tag: 'LineSegments', key: 'oc_b_' + rec.key + '_' + rec.dayKey,
-                    lines: [{ tag: 'Line', a: { x: du(sx), y: du(rec.l) }, b: { x: du(ex), y: du(rec.l) } }],
-                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op * 0.6 } });
-                items.push({ tag: 'LineSegments', key: 'oc_e_' + rec.key + '_' + rec.dayKey,
-                    lines: [{ tag: 'Line', a: { x: du(sx), y: du(rec.l) }, b: { x: du(sx), y: du(rec.h) } }],
-                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op } });
-            }
+        for (const rec of this.opens) {
             const fair = (rec.fairAt === 'close') ? rec.c : rec.o;
-            if (showFair) {
-                items.push({ tag: 'LineSegments', key: 'oc_f_' + rec.key + '_' + rec.dayKey,
-                    lines: [{ tag: 'Line', a: { x: du(sx), y: du(fair) }, b: { x: du(ex), y: du(fair) } }],
-                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op } });
-            }
-            if (showLabel) {
-                const pad = Math.max(rec.h - rec.l, Math.abs(rec.c) * 0.0003);
-                items.push({ tag: 'Text', key: 'oc_lbl_' + rec.key + '_' + rec.dayKey,
-                    text: rec.label + '  fair ' + fair.toFixed(2),
-                    point: { x: du(sx), y: du(rec.h + pad) },
-                    style: { fontSize: labelSize, fontWeight: rec.primary ? 'bold' : 'normal', fill: rec.color },
-                    textAlignment: 'leftMiddle' });
-            }
+            const pad = Math.max(rec.h - rec.l, Math.abs(rec.c) * 0.0003);
+            items.push({ tag: 'Text', key: 'oc_lbl_' + rec.key + '_' + rec.dayKey,
+                text: rec.label + '  fair ' + fair.toFixed(2),
+                point: { x: du(rec.chartIdx), y: du(rec.h + pad) },
+                style: { fontSize: labelSize, fontWeight: rec.primary ? 'bold' : 'normal', fill: rec.color },
+                textAlignment: 'leftMiddle' });
         }
     }
 
@@ -387,15 +367,10 @@ class OpeningCandleStrategy {
                 style: { fontSize: labelSize + 1, fontWeight: 'bold', fill: x.win ? C_WIN : C_LOSS },
                 textAlignment: 'centerMiddle' });
         }
-        // open position: entry / SL / TP lines + labels
+        // open position: entry / SL / TP value labels (the lines are drawn
+        // by the custom plotter).
         if (this.pos !== 0 && pget(p, 'showTradeLines', 1)) {
-            const sx = this.entryIdx, ex = this.lastChartIdx + 5;
-            const seg = (key, y, col) => items.push({ tag: 'LineSegments', key,
-                lines: [{ tag: 'Line', a: { x: du(sx), y: du(y) }, b: { x: du(ex), y: du(y) } }],
-                lineStyle: { lineWidth: 1, color: col, opacity: 0.95 } });
-            seg('st_pe', this.entryPx, C_ENTRY);
-            seg('st_ps', this.sl, C_SL);
-            seg('st_pt', this.tp, C_TP);
+            const ex = this.lastChartIdx + 5;
             const lbl = (key, y, txt, col) => items.push({ tag: 'Text', key,
                 text: txt, point: { x: du(ex), y: du(y) },
                 style: { fontSize: labelSize, fontWeight: 'bold', fill: col },
@@ -453,12 +428,70 @@ class OpeningCandleStrategy {
     }
 }
 
+// Custom plotter — draws all LINES (Tradovate's default renderer only draws
+// the Text/marker items returned from map). Reads the per-bar box geometry
+// (ocKey/ocH/ocL/ocFair/ocColor) the calculator wrote onto history items.
+function linePlotter(canvas, indicator, history) {
+    try {
+        const pt = plottingTools;
+        const p = indicator.props || {};
+        const data = history && history.data;
+        const n = data ? data.length : 0;
+        if (!n) return;
+
+        const lw = Math.max(1, (p.lineWidth != null ? p.lineWidth : 1));
+        const op = Math.max(0.1, Math.min(1, (p.opacity != null ? p.opacity : 0.85)));
+        const showZone = (p.showZone != null ? p.showZone : 1);
+        const showFair = (p.showFairLine != null ? p.showFairLine : 1);
+        const markersOn = (p.enableMarkers != null ? p.enableMarkers : 1);
+        const stratOn = (p.enableStrategy != null ? p.enableStrategy : 1);
+
+        // collect opening-candle bars + last x
+        const opens = [];
+        let lastX = null;
+        for (let i = 0; i < n; i++) {
+            const it = history.get(i);
+            if (!it) continue;
+            lastX = pt.x.get(it);
+            if (it.ocKey) opens.push({ x: lastX, h: it.ocH, l: it.ocL, fair: it.ocFair, col: it.ocColor });
+        }
+        if (lastX == null) return;
+
+        // fair-value boxes, each extended to the next open (or the live bar)
+        if (markersOn) {
+            for (let j = 0; j < opens.length; j++) {
+                const o = opens[j];
+                const sx = o.x;
+                const ex = (j + 1 < opens.length) ? opens[j + 1].x : lastX;
+                if (showZone) {
+                    canvas.drawLine(pt.offset(sx, o.h), pt.offset(ex, o.h), { color: o.col, lineWidth: lw, opacity: op * 0.6 });
+                    canvas.drawLine(pt.offset(sx, o.l), pt.offset(ex, o.l), { color: o.col, lineWidth: lw, opacity: op * 0.6 });
+                    canvas.drawLine(pt.offset(sx, o.l), pt.offset(sx, o.h), { color: o.col, lineWidth: lw, opacity: op });
+                }
+                if (showFair) {
+                    canvas.drawLine(pt.offset(sx, o.fair), pt.offset(ex, o.fair), { color: o.col, lineWidth: lw + 1, opacity: op });
+                }
+            }
+        }
+
+        // open-position entry / SL / TP lines
+        if (stratOn && (p.showTradeLines != null ? p.showTradeLines : 1) && indicator.pos) {
+            const back = history.get(Math.max(0, n - 60));
+            const sx = back ? pt.x.get(back) : lastX;
+            canvas.drawLine(pt.offset(sx, indicator.entryPx), pt.offset(lastX, indicator.entryPx), { color: '#dddddd', lineWidth: 1, opacity: 0.95 });
+            canvas.drawLine(pt.offset(sx, indicator.sl), pt.offset(lastX, indicator.sl), { color: '#ff4444', lineWidth: 1, opacity: 0.95 });
+            canvas.drawLine(pt.offset(sx, indicator.tp), pt.offset(lastX, indicator.tp), { color: '#00ff66', lineWidth: 1, opacity: 0.95 });
+        }
+    } catch (e) { /* swallow */ }
+}
+
 module.exports = {
     name: 'SD_OpeningCandle',
     description: 'Session fair-price candle marker + continuation/reversion strategy',
     calculator: OpeningCandleStrategy,
     inputType: 'bars',
     tags: ['SD'],
+    plotter: [predef.plotters.custom(linePlotter)],
     params: {
         // Shift bar timestamps to your exchange wall clock.
         // -4 = US Eastern (EDT, default). Use -5 for winter EST.

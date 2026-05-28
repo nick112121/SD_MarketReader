@@ -1,56 +1,82 @@
 'use strict';
 // ═══════════════════════════════════════════════════════════════════════
-// SD_OpeningCandle  —  Session "Fair Price" candle marker (time charts)
+// SD_OpeningCandle  —  Session "Fair Price" strategy (time charts)
 //
-// Built from the "high time-frame reversion, low time-frame continuation"
-// prop-firm strategy:
+// Implements the prop-firm strategy: "high time-frame reversion, low time-
+// frame continuation." Runs per session open (default NY 09:30 + EVE 18:00).
 //
-//   "I always mark out the candle pre-open, which we believe is the fair
-//    price. Any move away from that is unfair."
+//  1. MARK the fair-price candle:
+//       NY  09:29 pre-open candle (its CLOSE == the 09:30 open / fair price)
+//       EVE 18:00 reopen candle   (its OPEN == fair price)
+//     Drawn as a box (high/low) extended right + a fair-price line + label.
 //
-// By default it marks the TWO candles that strategy revolves around:
-//   • NY  09:29 — the candle just BEFORE the 09:30 RTH open. Its CLOSE is
-//                 the fair price (== the 09:30 open).
-//   • EVE 18:00 — the 6 PM reopen candle. Its OPEN is the fair price.
+//  2. SIGNALS off the session open candle:
+//       • CONTINUATION (first contMinutes, default 10): trade in the
+//         direction of the opening candle (overnight order flow).
+//       • MEAN REVERSION (contMinutes..revMinutes, default 10..90): once
+//         price has moved away from the open, trade back toward it.
+//       Entry trigger = DISPLACEMENT candle (bigger range than prior, body-
+//       dominant, small wicks) = grade A, or BREAK-OF-STRUCTURE + close
+//       beyond recent swing = grade A+. Signals opposing the session bias
+//       (B setups) are skipped.
+//       Fixed risk: tpPoints / slPoints (default 38 / 25 = ~1:1.5 R:R,
+//       NQ points). Each entry is tracked to TP or SL and marked WIN/LOSS.
+//       Capped at maxTradesPerSession; window ends 90 min after open
+//       (== 11:00 for NY, matching "stop looking after 11am").
 //
-// For each marked candle it draws:
-//   • a box anchored on the candle, extended right (top = high, bot = low)
-//   • a "fair price" line (the candle's close for pre-open candles, its
-//     open for reopen candles) — the level the strategy reverts back to
-//   • a label with the session name + fair price
+// TIMEFRAME: use a 1-minute time chart (the strategy's primary), 5-minute
+//   for quiet sessions. The chart timeframe is a Tradovate chart setting,
+//   not something an indicator can set — this study detects the bar
+//   interval and warns on-chart when it isn't 1m/5m.
 //
-// Extra optional sessions (off by default) can be toggled in the params:
-//   NEWS 08:29   NY PM 13:59   ASIA 20:00   LON 03:00
-//
-// Use on a TIME-based chart (1m recommended, as in the strategy). On a 1m
-// chart the 09:29 / 18:00 candles line up exactly; on higher timeframes
-// the nearest candle within openToleranceMin is used.
-//
-// tzOffsetHours: shift the bar timestamp to your exchange wall clock.
-//   -4 = US Eastern during DST (EDT, the default — matches the strategy's
-//   "EST" talk during summer). Use -5 for true winter EST.
+// tzOffsetHours: shift bar timestamps to your exchange wall clock.
+//   -4 = US Eastern during DST (EDT, default). Use -5 for winter EST.
 // ═══════════════════════════════════════════════════════════════════════
 
-const predef    = require('./tools/predef');
-const { du }    = require('./tools/graphics');
+const predef = require('./tools/predef');
+const { du } = require('./tools/graphics');
 
-function pget(p, key, def) {
-    return (p && p[key] != null) ? p[key] : def;
-}
+function pget(p, key, def) { return (p && p[key] != null) ? p[key] : def; }
+function sgn(x) { return x > 0 ? 1 : (x < 0 ? -1 : 0); }
 
-class OpeningCandleMarker {
+const C_BULL = '#26c281', C_BEAR = '#ff5b5b';
+const C_WIN  = '#00ff88', C_LOSS = '#ff4444';
+const C_TP   = '#00ff66', C_SL   = '#ff4444', C_ENTRY = '#dddddd';
+const C_WARN = '#ff5555', C_OK   = '#7fbf7f';
+
+class OpeningCandleStrategy {
 
     init(props) {
         if (props) this.props = props;
-        this.lastChartIdx = 0;     // d.index() of the most recent bar
-        this._bi = 0;              // fallback running counter
-        this.opens = [];           // detected opening candles, in time order
-        this._seen = {};           // "dayKey|SESS" -> index into this.opens
+        this.lastChartIdx = 0;
+        this._bi = 0;
+        // marker state
+        this.opens = [];           // marked fair-price candles
+        this._seen = {};           // "dayKey|SESS" -> index in opens
+        // timeframe detection
+        this._prevTs = null;
+        this._barMs = null;
+        this._lastClose = null;
+        this._lastHigh = null;
+        // bar store (timestamp-keyed so replays/ticks never corrupt it)
+        this.O = []; this.H = []; this.L = []; this.C = [];
+        this.M = []; this.X = []; this.DK = [];
+        this._tsIndex = new Map();
+        this._procUpTo = -1;       // last fully-closed bar index processed
+        // strategy state
+        this.active = null;        // current session: {key,label,color,fair,openDir,openMin,startK,trades}
+        this._stratSeen = {};      // "dayKey|SESS" -> open candle index
+        this.pos = 0;              // 0 flat, 1 long, -1 short
+        this.entryPx = 0; this.tp = 0; this.sl = 0;
+        this.entryIdx = 0; this.entryDir = 0; this.entryGrade = '';
+        this.entriesLog = [];      // {x,dir,grade,phase,price,lo,hi,color}
+        this.exitsLog = [];        // {x,win,price}
     }
 
-    // Session table. min = minutes from local midnight for the candle to
-    // mark. fairAt = which price of that candle is the "fair price" line
-    // ('close' for pre-open candles, 'open' for reopen candles).
+    // Session table. min = minute-of-day of the candle to MARK.
+    // fairAt = which price of that candle is the fair price ('close' for
+    // pre-open candles, 'open' for reopen candles). The strategy's open
+    // candle is at min+1 for pre-open sessions, min for reopen sessions.
     _sessions() {
         const p = this.props || {};
         return [
@@ -66,171 +92,371 @@ class OpeningCandleMarker {
     map(d) {
         const _ret = { graphics: { items: [] } };
         try {
-            const p  = this.props || {};
+            const p = this.props || {};
             const tz = pget(p, 'tzOffsetHours', -4);
+            const markers = pget(p, 'enableMarkers', 1);
+            const strat = pget(p, 'enableStrategy', 1);
 
             const o = d.open(), h = d.high(), l = d.low(), c = d.close();
-
-            // Chart bar index — what du() needs to position x.
             const chartIdx = (typeof d.index === 'function') ? d.index() : this._bi;
             this._bi++;
             this.lastChartIdx = chartIdx;
+            this._lastClose = c; this._lastHigh = h;
 
-            // ── Local wall-clock time (fixed tz offset, like the prop-firm
-            //    strategy's "Eastern" reference). ───────────────────────
             const ts = d.timestamp();
-            const lt = new Date(ts.getTime() + tz * 3600000);
-            const lth = lt.getUTCHours(), ltm = lt.getUTCMinutes();
-            const mins = lth * 60 + ltm;
+            const tms = ts.getTime();
+            const lt = new Date(tms + tz * 3600000);
+            const mins = lt.getUTCHours() * 60 + lt.getUTCMinutes();
             const dayKey = lt.getUTCFullYear() + '-' + (lt.getUTCMonth() + 1) + '-' + lt.getUTCDate();
 
-            // ── Detect each session's opening candle ───────────────────
-            // Mark the FIRST bar of each day that falls within `tol` minutes
-            // of the session open. The tolerance is what makes this robust
-            // to gaps / RTH-only data: if the first available bar is far
-            // past the open (e.g. an RTH chart whose data starts at 09:30,
-            // so there is no real 08:30 candle), that session is skipped
-            // instead of being mis-tagged onto a later bar. _seen dedups per
-            // day so replays and live ticks never create duplicates.
+            // ── timeframe detection (min positive delta == bar size) ──
+            if (this._prevTs != null) {
+                const dms = tms - this._prevTs;
+                if (dms > 0) this._barMs = (this._barMs == null) ? dms : Math.min(this._barMs, dms);
+            }
+            this._prevTs = tms;
+
+            // ── marker: mark each session's fair-price candle ──
             const tol = Math.max(0, pget(p, 'openToleranceMin', 15));
-            for (const s of this._sessions()) {
-                if (!s.on) continue;
-                const k = dayKey + '|' + s.key;
-                const seenIdx = this._seen[k];
-
-                if (seenIdx != null) {
-                    // Already recorded today. If this is still the same
-                    // (live) bar, let its high/low/close keep forming.
-                    const rec = this.opens[seenIdx];
-                    if (rec && rec.chartIdx === chartIdx) {
-                        rec.h = Math.max(rec.h, h);
-                        rec.l = Math.min(rec.l, l);
-                        rec.c = c;
+            if (markers) {
+                for (const s of this._sessions()) {
+                    if (!s.on) continue;
+                    const k = dayKey + '|' + s.key;
+                    const seenIdx = this._seen[k];
+                    if (seenIdx != null) {
+                        const rec = this.opens[seenIdx];
+                        if (rec && rec.chartIdx === chartIdx) { rec.h = Math.max(rec.h, h); rec.l = Math.min(rec.l, l); rec.c = c; }
+                        continue;
                     }
-                    continue;
-                }
-
-                const diff = mins - s.min;
-                if (diff >= 0 && diff <= tol) {
-                    this._seen[k] = this.opens.length;
-                    this.opens.push({
-                        key: s.key, label: s.label, color: s.color, fairAt: s.fairAt,
-                        primary: !!s.primary, chartIdx, o, h, l, c, dayKey
-                    });
+                    const diff = mins - s.min;
+                    if (diff >= 0 && diff <= tol) {
+                        this._seen[k] = this.opens.length;
+                        this.opens.push({ key: s.key, label: s.label, color: s.color, fairAt: s.fairAt, primary: !!s.primary, chartIdx, o, h, l, c, dayKey });
+                    }
                 }
             }
 
-            // ── Render on the last bar so spanning lines reach "now". ───
+            // ── bar store (dedup by timestamp) ──
+            let k = this._tsIndex.get(tms);
+            if (k == null) {
+                k = this.O.length;
+                this._tsIndex.set(tms, k);
+                this.O.push(o); this.H.push(h); this.L.push(l); this.C.push(c);
+                this.M.push(mins); this.X.push(chartIdx); this.DK.push(dayKey);
+            } else {
+                this.O[k] = o; this.H[k] = h; this.L[k] = l; this.C[k] = c;
+                this.M[k] = mins; this.X[k] = chartIdx; this.DK[k] = dayKey;
+            }
+
+            // ── strategy: step every newly-closed bar (last bar is forming) ──
+            if (strat) {
+                const lastClosed = this.O.length - 2;
+                for (let j = this._procUpTo + 1; j <= lastClosed; j++) this._step(j);
+                if (lastClosed > this._procUpTo) this._procUpTo = lastClosed;
+            }
+
             const isLast = (typeof d.isLast === 'function') && d.isLast();
             if (isLast) this._draw(_ret.graphics.items, p);
-
         } catch (e) { /* never throw out of map */ }
         return _ret;
     }
 
+    // ── strategy stepping for a fully-closed bar at array index k ──
+    _step(k) {
+        const p = this.props || {};
+        const tol = Math.max(0, pget(p, 'openToleranceMin', 15));
+        const contMin = pget(p, 'contMinutes', 10);
+        const revMin = pget(p, 'revMinutes', 90);
+
+        // 1. manage open position
+        if (this.pos !== 0) this._checkExit(k);
+
+        // 2. detect session open candle
+        for (const s of this._sessions()) {
+            if (!s.on) continue;
+            const openMin = (s.fairAt === 'close') ? s.min + 1 : s.min;
+            const sk = this.DK[k] + '|' + s.key;
+            if (this._stratSeen[sk] != null) continue;
+            const diff = this.M[k] - openMin;
+            if (diff >= 0 && diff <= tol) {
+                this._stratSeen[sk] = k;
+                this.active = {
+                    key: s.key, label: s.label, color: s.color,
+                    fair: this.O[k], openDir: sgn(this.C[k] - this.O[k]),
+                    openMin, startK: k, trades: 0
+                };
+            }
+        }
+
+        // 3. close session window after revMin
+        if (this.active && this.M[k] > this.active.openMin + revMin) this.active = null;
+
+        // 4. entry
+        if (this.pos === 0 && this.active && k > this.active.startK) this._maybeEnter(k, contMin, revMin);
+    }
+
+    _maybeEnter(k, contMin, revMin) {
+        const p = this.props || {};
+        const maxTrades = pget(p, 'maxTradesPerSession', 5);
+        const revMove = pget(p, 'revMinMovePts', 10);
+        if (this.active.trades >= maxTrades) return;
+
+        const trig = this._trigger(k);
+        if (!trig) return;
+
+        // bias by phase
+        const m = this.M[k];
+        let bias = 0, phase = '';
+        if (m <= this.active.openMin + contMin) { phase = 'C'; bias = this.active.openDir; }
+        else if (m <= this.active.openMin + revMin) {
+            phase = 'R';
+            const dToFair = this.active.fair - this.C[k];
+            if (Math.abs(dToFair) >= revMove) bias = sgn(dToFair);
+        }
+        if (bias === 0 || trig.dir !== bias) return;  // no bias / B setup -> skip
+
+        const tp = pget(p, 'tpPoints', 38), sl = pget(p, 'slPoints', 25);
+        this.pos = trig.dir;
+        this.entryPx = this.C[k];
+        this.entryDir = trig.dir;
+        this.tp = this.entryPx + trig.dir * tp;
+        this.sl = this.entryPx - trig.dir * sl;
+        this.entryIdx = this.X[k];
+        this.entryGrade = trig.grade;
+        this.active.trades++;
+        this.entriesLog.push({
+            x: this.X[k], dir: trig.dir, grade: trig.grade, phase,
+            price: this.entryPx, lo: this.L[k], hi: this.H[k],
+            color: trig.dir === 1 ? C_BULL : C_BEAR
+        });
+    }
+
+    // Trigger on bar k: BOS+close (A+) takes priority over displacement (A).
+    _trigger(k) {
+        const p = this.props || {};
+        const look = pget(p, 'bosLookback', 12);
+        const bodyFrac = pget(p, 'dispBodyFrac', 0.6);
+        if (k < look + 1) return null;
+
+        const range = this.H[k] - this.L[k];
+        const prevRange = this.H[k - 1] - this.L[k - 1];
+        const body = Math.abs(this.C[k] - this.O[k]);
+        const prevBody = Math.abs(this.C[k - 1] - this.O[k - 1]);
+        const bull = this.C[k] > this.O[k], bear = this.C[k] < this.O[k];
+
+        // break of structure: close beyond the prior `look` bars' range
+        let hh = -Infinity, ll = Infinity;
+        for (let j = k - look; j <= k - 1; j++) { if (this.H[j] > hh) hh = this.H[j]; if (this.L[j] < ll) ll = this.L[j]; }
+        if (this.C[k] > hh) return { dir: 1, grade: 'A+' };
+        if (this.C[k] < ll) return { dir: -1, grade: 'A+' };
+
+        // displacement: bigger range + body-dominant + bigger body than prior
+        const disp = range > prevRange && body >= bodyFrac * range && body > prevBody && (bull || bear);
+        if (disp) return { dir: bull ? 1 : -1, grade: 'A' };
+        return null;
+    }
+
+    _checkExit(k) {
+        const dir = this.pos;
+        let win = null;
+        if (dir === 1) {
+            if (this.L[k] <= this.sl) win = false;        // SL first (conservative)
+            else if (this.H[k] >= this.tp) win = true;
+        } else {
+            if (this.H[k] >= this.sl) win = false;
+            else if (this.L[k] <= this.tp) win = true;
+        }
+        if (win != null) {
+            this.exitsLog.push({ x: this.X[k], win, price: win ? this.tp : this.sl });
+            this.pos = 0;
+        }
+    }
+
     _draw(items, p) {
-        const showZone  = pget(p, 'showZone',     1);
-        const showFair  = pget(p, 'showFairLine', 1);
-        const showLabel = pget(p, 'showLabel',    1);
-        const extendBars = pget(p, 'extendBars',  0);   // 0 = until next open
-        const lw  = Math.max(1, pget(p, 'lineWidth', 1));
-        const op  = Math.max(0.1, Math.min(1, pget(p, 'opacity', 0.85)));
+        // ── markers ──
+        if (pget(p, 'enableMarkers', 1)) this._drawMarkers(items, p);
+        // ── strategy signals ──
+        if (pget(p, 'enableStrategy', 1)) this._drawStrategy(items, p);
+        // ── timeframe notice ──
+        if (pget(p, 'tfWarning', 1)) this._drawTF(items, p);
+    }
+
+    _drawMarkers(items, p) {
+        const showZone = pget(p, 'showZone', 1);
+        const showFair = pget(p, 'showFairLine', 1);
+        const showLabel = pget(p, 'showLabel', 1);
+        const extendBars = pget(p, 'extendBars', 0);
+        const lw = Math.max(1, pget(p, 'lineWidth', 1));
+        const op = Math.max(0.1, Math.min(1, pget(p, 'opacity', 0.85)));
         const labelSize = Math.max(7, pget(p, 'labelSize', 11));
 
         for (let i = 0; i < this.opens.length; i++) {
             const rec = this.opens[i];
             const next = this.opens[i + 1];
             const sx = rec.chartIdx;
-
-            // Right edge: the next open of any session, else the live bar.
             let ex = next ? next.chartIdx : (this.lastChartIdx + 5);
             if (extendBars > 0) ex = Math.min(ex, sx + extendBars);
             if (ex <= sx) ex = sx + 1;
+            const zlw = rec.primary ? lw + 1 : lw;
 
-            const isNY = rec.primary;
-            const zoneLw = isNY ? lw + 1 : lw;
-            const fairLw = isNY ? lw + 1 : lw;
-
-            // High / low fair-value rectangle, extended right.
             if (showZone) {
-                items.push({
-                    tag: 'LineSegments', key: 'oc_t_' + rec.key + '_' + rec.dayKey,
+                items.push({ tag: 'LineSegments', key: 'oc_t_' + rec.key + '_' + rec.dayKey,
                     lines: [{ tag: 'Line', a: { x: du(sx), y: du(rec.h) }, b: { x: du(ex), y: du(rec.h) } }],
-                    lineStyle: { lineWidth: zoneLw, color: rec.color, opacity: op * 0.6 }
-                });
-                items.push({
-                    tag: 'LineSegments', key: 'oc_b_' + rec.key + '_' + rec.dayKey,
+                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op * 0.6 } });
+                items.push({ tag: 'LineSegments', key: 'oc_b_' + rec.key + '_' + rec.dayKey,
                     lines: [{ tag: 'Line', a: { x: du(sx), y: du(rec.l) }, b: { x: du(ex), y: du(rec.l) } }],
-                    lineStyle: { lineWidth: zoneLw, color: rec.color, opacity: op * 0.6 }
-                });
-                // Left edge — marks WHERE the opening candle is.
-                items.push({
-                    tag: 'LineSegments', key: 'oc_e_' + rec.key + '_' + rec.dayKey,
+                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op * 0.6 } });
+                items.push({ tag: 'LineSegments', key: 'oc_e_' + rec.key + '_' + rec.dayKey,
                     lines: [{ tag: 'Line', a: { x: du(sx), y: du(rec.l) }, b: { x: du(sx), y: du(rec.h) } }],
-                    lineStyle: { lineWidth: zoneLw, color: rec.color, opacity: op }
-                });
+                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op } });
             }
-
-            // Fair price line. Pre-open candle -> its CLOSE (== the session
-            // open price). Reopen candle -> its OPEN.
             const fair = (rec.fairAt === 'close') ? rec.c : rec.o;
             if (showFair) {
-                items.push({
-                    tag: 'LineSegments', key: 'oc_f_' + rec.key + '_' + rec.dayKey,
+                items.push({ tag: 'LineSegments', key: 'oc_f_' + rec.key + '_' + rec.dayKey,
                     lines: [{ tag: 'Line', a: { x: du(sx), y: du(fair) }, b: { x: du(ex), y: du(fair) } }],
-                    lineStyle: { lineWidth: fairLw, color: rec.color, opacity: op }
-                });
+                    lineStyle: { lineWidth: zlw, color: rec.color, opacity: op } });
             }
-
-            // Label above the candle.
             if (showLabel) {
                 const pad = Math.max(rec.h - rec.l, Math.abs(rec.c) * 0.0003);
-                items.push({
-                    tag: 'Text', key: 'oc_lbl_' + rec.key + '_' + rec.dayKey,
+                items.push({ tag: 'Text', key: 'oc_lbl_' + rec.key + '_' + rec.dayKey,
                     text: rec.label + '  fair ' + fair.toFixed(2),
                     point: { x: du(sx), y: du(rec.h + pad) },
                     style: { fontSize: labelSize, fontWeight: rec.primary ? 'bold' : 'normal', fill: rec.color },
-                    textAlignment: 'leftMiddle'
-                });
+                    textAlignment: 'leftMiddle' });
             }
         }
+    }
+
+    _drawStrategy(items, p) {
+        const labelSize = Math.max(7, pget(p, 'labelSize', 11));
+        const padOf = (price, lo, hi) => Math.max((hi - lo) || 0, Math.abs(price) * 0.0004);
+
+        // entry arrows
+        for (let i = 0; i < this.entriesLog.length; i++) {
+            const e = this.entriesLog[i];
+            const pad = padOf(e.price, e.lo, e.hi);
+            const up = e.dir === 1;
+            const phaseTag = e.phase === 'C' ? 'CONT' : 'REV';
+            items.push({ tag: 'Text', key: 'st_en_' + i,
+                text: (up ? '▲ ' : '▼ ') + e.grade + ' ' + phaseTag,
+                point: { x: du(e.x), y: du(up ? e.lo - pad : e.hi + pad) },
+                style: { fontSize: labelSize, fontWeight: 'bold', fill: e.color },
+                textAlignment: 'centerMiddle' });
+        }
+        // exit markers
+        for (let i = 0; i < this.exitsLog.length; i++) {
+            const x = this.exitsLog[i];
+            items.push({ tag: 'Text', key: 'st_ex_' + i,
+                text: x.win ? '✓' : '✗',
+                point: { x: du(x.x), y: du(x.price) },
+                style: { fontSize: labelSize + 1, fontWeight: 'bold', fill: x.win ? C_WIN : C_LOSS },
+                textAlignment: 'centerMiddle' });
+        }
+        // open position: entry / SL / TP lines + labels
+        if (this.pos !== 0 && pget(p, 'showTradeLines', 1)) {
+            const sx = this.entryIdx, ex = this.lastChartIdx + 5;
+            const seg = (key, y, col) => items.push({ tag: 'LineSegments', key,
+                lines: [{ tag: 'Line', a: { x: du(sx), y: du(y) }, b: { x: du(ex), y: du(y) } }],
+                lineStyle: { lineWidth: 1, color: col, opacity: 0.95 } });
+            seg('st_pe', this.entryPx, C_ENTRY);
+            seg('st_ps', this.sl, C_SL);
+            seg('st_pt', this.tp, C_TP);
+            const lbl = (key, y, txt, col) => items.push({ tag: 'Text', key,
+                text: txt, point: { x: du(ex), y: du(y) },
+                style: { fontSize: labelSize, fontWeight: 'bold', fill: col },
+                textAlignment: 'leftMiddle', global: true });
+            lbl('st_pel', this.entryPx, (this.pos === 1 ? 'LONG ' : 'SHORT ') + this.entryPx.toFixed(2) + ' [' + this.entryGrade + ']', C_ENTRY);
+            lbl('st_psl', this.sl, 'SL ' + this.sl.toFixed(2), C_SL);
+            lbl('st_ptl', this.tp, 'TP ' + this.tp.toFixed(2), C_TP);
+        }
+
+        // status HUD (top of chart, anchored at last bar)
+        const baseY = (this._lastHigh || this._lastClose || 0);
+        const pad = Math.abs(this._lastClose || 1) * 0.0018;
+        const wins = this.exitsLog.filter(e => e.win).length;
+        const losses = this.exitsLog.length - wins;
+        let line;
+        if (this.active) {
+            const max = pget(p, 'maxTradesPerSession', 5);
+            line = this.active.label.split(' ')[0] + '  trades ' + this.active.trades + '/' + max +
+                   '  fair ' + this.active.fair.toFixed(0) + '  W' + wins + '/L' + losses;
+        } else {
+            line = 'no active session  W' + wins + '/L' + losses;
+        }
+        items.push({ tag: 'Text', key: 'st_hud',
+            text: line, point: { x: du(this.lastChartIdx), y: du(baseY + pad * 2.4) },
+            style: { fontSize: labelSize, fontWeight: 'bold', fill: '#cccccc' },
+            textAlignment: 'leftMiddle', global: true });
+    }
+
+    _drawTF(items, p) {
+        const labelSize = Math.max(7, pget(p, 'labelSize', 11));
+        const baseY = (this._lastHigh || this._lastClose || 0);
+        const pad = Math.abs(this._lastClose || 1) * 0.0018;
+        const bm = this._barMs ? this._barMs / 60000 : null;       // bar size in minutes
+        let text, col;
+        if (bm == null) { return; }
+        else if (bm >= 0.9 && bm <= 1.1) { text = '1m ✓ strategy timeframe'; col = C_OK; }
+        else if (bm >= 4.5 && bm <= 5.5) { text = '5m — low-volume fallback (use 1m for NY)'; col = C_OK; }
+        else {
+            const shown = bm >= 1 ? Math.round(bm) + 'm' : Math.round(bm * 60) + 's';
+            text = '⚠ chart is ' + shown + ' — switch to 1m (5m for quiet sessions)';
+            col = C_WARN;
+        }
+        items.push({ tag: 'Text', key: 'st_tf',
+            text, point: { x: du(this.lastChartIdx), y: du(baseY + pad * 4) },
+            style: { fontSize: labelSize, fontWeight: 'bold', fill: col },
+            textAlignment: 'leftMiddle', global: true });
     }
 }
 
 module.exports = {
     name: 'SD_OpeningCandle',
-    description: 'Session Open / Fair Price candle marker',
-    calculator: OpeningCandleMarker,
+    description: 'Session fair-price candle marker + continuation/reversion strategy',
+    calculator: OpeningCandleStrategy,
     inputType: 'bars',
     tags: ['SD'],
     params: {
         // Shift bar timestamps to your exchange wall clock.
-        // -4 = US Eastern (EDT). Use -5 for true winter EST.
+        // -4 = US Eastern (EDT, default). Use -5 for winter EST.
         tzOffsetHours: predef.paramSpecs.number(-4, 1, -12),
-        // Session toggles (1 = mark that candle, 0 = ignore). Defaults mark
-        // the two candles the strategy uses: 09:29 pre-open and 18:00 reopen.
-        sessNY:      predef.paramSpecs.number(1, 1, 0),   // 09:29 NY pre-open
-        sessEvening: predef.paramSpecs.number(1, 1, 0),   // 18:00 reopen
-        sessNewsAM:  predef.paramSpecs.number(0, 1, 0),   // 08:29 pre-news
-        sessNYPM:    predef.paramSpecs.number(0, 1, 0),   // 13:59 NY PM pre-open
-        sessAsia:    predef.paramSpecs.number(0, 1, 0),   // 20:00 Asia
-        sessLondon:  predef.paramSpecs.number(0, 1, 0),   // 03:00 London
-        // How many minutes after the target the first bar may be and still
-        // count as that candle. On a 1m chart the target candle is exact
-        // (diff 0); the tolerance only matters on gappy / higher-TF charts.
-        // Keep below 60 so adjacent sessions never bleed together.
+
+        // ── master switches ──
+        enableMarkers:  predef.paramSpecs.number(1, 1, 0),  // draw fair-price candle boxes
+        enableStrategy: predef.paramSpecs.number(1, 1, 0),  // generate signals
+        tfWarning:      predef.paramSpecs.number(1, 1, 0),  // on-chart timeframe notice
+
+        // ── sessions (1 = use, 0 = ignore). Defaults: 09:29 + 18:00 ──
+        sessNY:      predef.paramSpecs.number(1, 1, 0),
+        sessEvening: predef.paramSpecs.number(1, 1, 0),
+        sessNewsAM:  predef.paramSpecs.number(0, 1, 0),
+        sessNYPM:    predef.paramSpecs.number(0, 1, 0),
+        sessAsia:    predef.paramSpecs.number(0, 1, 0),
+        sessLondon:  predef.paramSpecs.number(0, 1, 0),
+        // first bar may be this many minutes past the target and still count
+        // (keep < 60 so adjacent sessions don't merge). On 1m it's exact.
         openToleranceMin: predef.paramSpecs.number(15, 1, 0),
-        // What to draw.
-        showZone:     predef.paramSpecs.number(1, 1, 0),  // high/low rectangle
-        showFairLine: predef.paramSpecs.number(1, 1, 0),  // fair price line
-        showLabel:    predef.paramSpecs.number(1, 1, 0),
-        // 0 = extend each box until the next session open (or the live bar).
-        // >0 = cap the box width at this many bars.
-        extendBars:  predef.paramSpecs.number(0, 5, 0),
-        // Appearance.
-        lineWidth:   predef.paramSpecs.number(1, 1, 1),
-        opacity:     predef.paramSpecs.number(0.85, 0.05, 0.1),
-        labelSize:   predef.paramSpecs.number(11, 1, 7),
+
+        // ── strategy logic ──
+        contMinutes: predef.paramSpecs.number(10, 1, 0),    // continuation window after open
+        revMinutes:  predef.paramSpecs.number(90, 5, 0),    // reversion window after open
+        maxTradesPerSession: predef.paramSpecs.number(5, 1, 1),
+        bosLookback: predef.paramSpecs.number(12, 1, 2),    // bars for break-of-structure
+        dispBodyFrac: predef.paramSpecs.number(0.6, 0.05, 0.1), // displacement body/range
+        revMinMovePts: predef.paramSpecs.number(10, 1, 0),  // min move from fair to fade
+        // fixed risk in points (NQ). 38/25 ≈ 1:1.5 R:R.
+        tpPoints: predef.paramSpecs.number(38, 1, 1),
+        slPoints: predef.paramSpecs.number(25, 1, 1),
+
+        // ── appearance ──
+        showZone:      predef.paramSpecs.number(1, 1, 0),
+        showFairLine:  predef.paramSpecs.number(1, 1, 0),
+        showLabel:     predef.paramSpecs.number(1, 1, 0),
+        showTradeLines: predef.paramSpecs.number(1, 1, 0),
+        extendBars:    predef.paramSpecs.number(0, 5, 0),
+        lineWidth:     predef.paramSpecs.number(1, 1, 1),
+        opacity:       predef.paramSpecs.number(0.85, 0.05, 0.1),
+        labelSize:     predef.paramSpecs.number(11, 1, 7),
     },
     plots: {},
     schemeStyles: { dark: {} },

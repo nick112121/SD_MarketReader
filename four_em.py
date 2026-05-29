@@ -93,12 +93,18 @@ def _most_recent_930(intra):
 
 
 def _status(sd, sw):
+    """Level-specific position vs the daily EM bands (R1/R2/S1/S2/etc.)."""
     a = abs(sd)
-    if a < 0.5:    base = "inside — building"
-    elif a < 0.9:  base = "approaching daily EM"
-    elif a < 1.15: base = "AT daily EM (1σ)"
-    elif a < 1.6:  base = "PAST daily EM"
-    else:          base = "well past daily EM"
+    side = "R" if sd >= 0 else "S"
+    if a < 0.4:    base = f"inside — between open and {side}1"
+    elif a < 0.6:  base = f"AT {side}1 (0.5 EM)"
+    elif a < 0.9:  base = f"between {side}1 and {side}2"
+    elif a < 1.15: base = f"AT {side}2 (1 EM) — daily EM"
+    elif a < 1.4:  base = f"ABOVE {side}2 — past daily EM"
+    elif a < 1.6:  base = f"AT {side}3 (1.5 EM)"
+    elif a < 1.9:  base = f"ABOVE {side}3 — well past 1.5 EM"
+    elif a < 2.1:  base = f"AT {side}4 (2 EM) — daily extreme"
+    else:          base = "OUTLIER — past 2 EM"
     if a >= 1.0:
         aw = abs(sw)
         if aw >= 1.0:   base += " · AT weekly EM"
@@ -308,12 +314,53 @@ def compute_gamma():
                 pw_row = puts.loc[puts["openInterest"].idxmax()]
             else:
                 pw_row = None
+            call_wall = float(cw_row["strike"]) if cw_row is not None else None
+            call_oi   = int(cw_row["openInterest"]) if cw_row is not None else 0
+            put_wall  = float(pw_row["strike"]) if pw_row is not None else None
+            put_oi    = int(pw_row["openInterest"]) if pw_row is not None else 0
+
+            # ── Position vs the walls ─────────────────────────────────────
+            # "At" the wall = within 0.5% of the strike (≈ a few pts on SPY/QQQ).
+            position = position_short = "—"
+            position_color = "#888"
+            dist_cw = dist_pw = pct_in_range = None
+            if call_wall is not None and put_wall is not None and cur:
+                THR = 0.005
+                dist_cw = round(cur - call_wall, 2)
+                dist_pw = round(cur - put_wall, 2)
+                cw_thr = call_wall * THR
+                pw_thr = put_wall * THR
+                if call_wall > put_wall:
+                    pct_in_range = round((cur - put_wall) / (call_wall - put_wall) * 100, 1)
+                if cur > call_wall + cw_thr:
+                    position = "ABOVE call wall — squeeze / dealer short gamma"
+                    position_short = "ABOVE CW"
+                    position_color = "#ffcc44"
+                elif abs(cur - call_wall) <= cw_thr:
+                    position = "AT call wall — magnet / pin"
+                    position_short = "AT CW"
+                    position_color = "#ff8c44"
+                elif cur < put_wall - pw_thr:
+                    position = "BELOW put wall — support broken"
+                    position_short = "BELOW PW"
+                    position_color = "#ff4466"
+                elif abs(cur - put_wall) <= pw_thr:
+                    position = "AT put wall — support test"
+                    position_short = "AT PW"
+                    position_color = "#ff8c44"
+                else:
+                    position = "between walls — normal range"
+                    position_short = "BETWEEN"
+                    position_color = "#00cc88"
+
             rows.append({
                 "ticker": tkr, "expiry": exp, "price": round(cur, 2),
-                "callWall": float(cw_row["strike"]) if cw_row is not None else None,
-                "callOI":   int(cw_row["openInterest"]) if cw_row is not None else 0,
-                "putWall":  float(pw_row["strike"]) if pw_row is not None else None,
-                "putOI":    int(pw_row["openInterest"]) if pw_row is not None else 0,
+                "callWall": call_wall, "callOI": call_oi,
+                "putWall":  put_wall,  "putOI":  put_oi,
+                "position": position, "positionShort": position_short,
+                "positionColor": position_color,
+                "distCallWall": dist_cw, "distPutWall": dist_pw,
+                "pctInRange": pct_in_range,
             })
         except Exception as e:
             rows.append({"ticker": tkr, "error": str(e)})
@@ -427,10 +474,16 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 .gcard .gh{display:flex;justify-content:space-between;align-items:baseline}
 .gcard .gt{font-size:1.1rem;font-weight:800}
 .gcard .gpx{font-size:.85rem;color:#aaa}
-.gcard .gw{display:flex;gap:14px;font-size:.82rem;margin-top:8px;flex-wrap:wrap}
+.gcard .gtag{font-size:.78rem;font-weight:800;letter-spacing:.06em}
+.gbar{position:relative;height:8px;background:#1c1c1c;border-radius:4px;margin:9px 0 6px}
+.gbar .gend{position:absolute;top:-3px;width:2px;height:14px;background:#666}
+.gbar .glabL,.gbar .glabR{position:absolute;top:11px;font-size:.6rem;color:#777}
+.gbar .glabL{left:0}.gbar .glabR{right:0}
+.gbar .gpos{position:absolute;top:-3px;width:3px;height:14px;background:#fff;border-radius:1px;box-shadow:0 0 4px #fff}
+.gcard .gw{display:flex;gap:14px;font-size:.82rem;margin-top:18px;flex-wrap:wrap}
 .gcard .cw{color:#00cc88;font-weight:700}
 .gcard .pw{color:#ff6688;font-weight:700}
-.gcard .gd{font-size:.66rem;color:#666;margin-top:6px}
+.gcard .gd{font-size:.74rem;margin-top:7px;font-weight:600}
 
 .note{font-size:.72rem;color:#666;text-align:center;margin:22px 0;line-height:1.65}
 </style></head><body>
@@ -535,17 +588,33 @@ function renderOpenRange(o){
   document.getElementById('openrange').innerHTML = h;
 }
 
+function gbar(pct){
+  // pct can be negative (below put wall) or >100 (above call wall) — clip the marker.
+  const clip = Math.max(0, Math.min(100, pct));
+  return '<div class=gbar>'
+    +'<div class=gend style="left:0%"></div>'
+    +'<div class=gend style="left:100%"></div>'
+    +'<div class=gpos style="left:'+clip+'%"></div>'
+    +'<span class=glabL>put wall</span><span class=glabR>call wall</span>'
+    +'</div>';
+}
 function renderGamma(g){
   const h = (g||[]).map(r=>{
     if(r.error) return '<div class=gcard><span class=gt>'+r.ticker+'</span> — '+r.error+'</div>';
+    const dcw = r.distCallWall;
+    const dpw = r.distPutWall;
+    const dcwStr = dcw!=null ? (dcw>=0?'+':'')+dcw : '—';
+    const dpwStr = dpw!=null ? (dpw>=0?'+':'')+dpw : '—';
+    const tag = '<span class=gtag style="color:'+r.positionColor+'">'+r.positionShort+'</span>';
+    const ladder = r.pctInRange!=null ? gbar(r.pctInRange) : '';
     return '<div class=gcard>'
-      +'<div class=gh><div><span class=gt>'+r.ticker+'</span> <span class=gpx>px '+fmt(r.price)+'</span></div>'
-      +'<span class=gpx>exp '+r.expiry+'</span></div>'
+      +'<div class=gh><div><span class=gt>'+r.ticker+'</span> <span class=gpx>px '+fmt(r.price)+' · exp '+r.expiry+'</span></div>'+tag+'</div>'
+      +ladder
       +'<div class=gw>'
-      +'<span>call wall <span class=cw>'+fmt(r.callWall)+'</span> ('+fmt(r.callOI)+' OI)</span>'
-      +'<span>put wall <span class=pw>'+fmt(r.putWall)+'</span> ('+fmt(r.putOI)+' OI)</span>'
+      +'<span>call wall <span class=cw>'+fmt(r.callWall)+'</span> <span class=gpx>('+fmt(r.callOI)+' OI · '+dcwStr+')</span></span>'
+      +'<span>put wall <span class=pw>'+fmt(r.putWall)+'</span> <span class=gpx>('+fmt(r.putOI)+' OI · '+dpwStr+')</span></span>'
       +'</div>'
-      +'<div class=gd>max-OI strikes on nearest expiry — call wall = magnet/resistance, put wall = dealer support</div>'
+      +'<div class=gd style="color:'+r.positionColor+'">'+r.position+'</div>'
       +'</div>';
   }).join('');
   document.getElementById('gamma').innerHTML = h;

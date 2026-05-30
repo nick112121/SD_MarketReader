@@ -79,16 +79,43 @@ class OpeningCandleStrategy {
     // fairAt = which price of that candle is the fair price ('close' for
     // pre-open candles, 'open' for reopen candles). The strategy's open
     // candle is at min+1 for pre-open sessions, min for reopen sessions.
+    // `on` is computed dynamically via _isSessionActive so toggling a
+    // session OR switching the chart timeframe takes effect immediately,
+    // even on bars whose oc* flags were set on a previous param state.
     _sessions() {
-        const p = this.props || {};
-        return [
-            { key: 'NY',   label: 'NY 9:29',    min:  9 * 60 + 29, fairAt: 'close', on: pget(p, 'sessNY',      1), color: '#00CCFF', primary: true },
-            { key: 'EVE',  label: 'EVE 6:00',   min: 18 * 60,      fairAt: 'open',  on: pget(p, 'sessEvening', 1), color: '#88AAFF' },
-            { key: 'NEWS', label: 'NEWS 8:29',  min:  8 * 60 + 29, fairAt: 'close', on: pget(p, 'sessNewsAM',  0), color: '#FF8C00' },
-            { key: 'NYPM', label: 'NY PM 1:59', min: 13 * 60 + 59, fairAt: 'close', on: pget(p, 'sessNYPM',    0), color: '#FF55DD' },
-            { key: 'ASIA', label: 'ASIA 8:00',  min: 20 * 60,      fairAt: 'open',  on: pget(p, 'sessAsia',    0), color: '#FFD24D' },
-            { key: 'LON',  label: 'LON 3:00',   min:  3 * 60,      fairAt: 'open',  on: pget(p, 'sessLondon',  0), color: '#A0FF88' },
+        const all = [
+            { key: 'NY',   label: 'NY 9:29',    min:  9 * 60 + 29, fairAt: 'close', color: '#00CCFF', primary: true },
+            { key: 'EVE',  label: 'EVE 6:00',   min: 18 * 60,      fairAt: 'open',  color: '#88AAFF' },
+            { key: 'NEWS', label: 'NEWS 8:29',  min:  8 * 60 + 29, fairAt: 'close', color: '#FF8C00' },
+            { key: 'NYPM', label: 'NY PM 1:59', min: 13 * 60 + 59, fairAt: 'close', color: '#FF55DD' },
+            { key: 'ASIA', label: 'ASIA 8:00',  min: 20 * 60,      fairAt: 'open',  color: '#FFD24D' },
+            { key: 'LON',  label: 'LON 3:00',   min:  3 * 60,      fairAt: 'open',  color: '#A0FF88' },
         ];
+        for (const s of all) s.on = this._isSessionActive(s.key);
+        return all;
+    }
+
+    // Detected bar size in minutes (null until two timestamps have been seen).
+    _tfMin() { return this._barMs ? this._barMs / 60000 : null; }
+
+    // Is a session currently active? Combines the autoSession mode (1m
+    // chart -> NY only, 5m chart -> EVE only) with the manual sessXxx
+    // toggles. NEWS/NYPM/ASIA/LON always follow their toggles.
+    _isSessionActive(key) {
+        const p = this.props || {};
+        const toggleKey = {
+            NY: 'sessNY', EVE: 'sessEvening', NEWS: 'sessNewsAM',
+            NYPM: 'sessNYPM', ASIA: 'sessAsia', LON: 'sessLondon'
+        }[key];
+        const auto = pget(p, 'autoSession', 1);
+        if (auto && (key === 'NY' || key === 'EVE')) {
+            const tf = this._tfMin();
+            if (tf == null) return key === 'NY';         // default to NY before TF known
+            if (tf >= 0.9 && tf <= 1.1) return key === 'NY';
+            if (tf >= 4.5 && tf <= 5.5) return key === 'EVE';
+            return false;                                 // unsupported TF -> both off
+        }
+        return !!pget(p, toggleKey, 0);
     }
 
     map(d) {
@@ -203,8 +230,10 @@ class OpeningCandleStrategy {
             }
         }
 
-        // 3. close session window after revMin
+        // 3. close session window after revMin, or if the session was
+        //    just toggled off (manually or by an autoSession TF switch).
         if (this.active && this.M[k] > this.active.openMin + revMin) this.active = null;
+        if (this.active && !this._isSessionActive(this.active.key)) this.active = null;
 
         // 4. volume tracking — flag "volume died" once it fades vs the
         //    session average (only after the continuation window).
@@ -332,6 +361,7 @@ class OpeningCandleStrategy {
         if (!pget(p, 'showLabel', 1)) return;
         const labelSize = Math.max(7, pget(p, 'labelSize', 11));
         for (const rec of this.opens) {
+            if (!this._isSessionActive(rec.key)) continue;  // session toggled off / TF mismatch
             const fair = (rec.fairAt === 'close') ? rec.c : rec.o;
             const pad = Math.max(rec.h - rec.l, Math.abs(rec.c) * 0.0003);
             items.push({ tag: 'Text', key: 'oc_lbl_' + rec.key + '_' + rec.dayKey,
@@ -453,16 +483,19 @@ function linePlotter(canvas, indicator, history) {
             const it = history.get(i);
             if (!it) continue;
             lastX = pt.x.get(it);
-            if (it.ocKey) opens.push({ x: lastX, h: it.ocH, l: it.ocL, fair: it.ocFair, col: it.ocColor });
+            if (it.ocKey) opens.push({ key: it.ocKey, x: lastX, h: it.ocH, l: it.ocL, fair: it.ocFair, col: it.ocColor });
         }
         if (lastX == null) return;
 
-        // fair-value boxes, each extended to the next open (or the live bar)
+        // fair-value boxes, each extended to the next open (or the live bar).
+        // Skip any open whose session is currently inactive (toggled off, or
+        // filtered out by autoSession when the chart TF doesn't match).
         if (markersOn) {
-            for (let j = 0; j < opens.length; j++) {
-                const o = opens[j];
+            const activeOpens = opens.filter(o => indicator._isSessionActive(o.key));
+            for (let j = 0; j < activeOpens.length; j++) {
+                const o = activeOpens[j];
                 const sx = o.x;
-                const ex = (j + 1 < opens.length) ? opens[j + 1].x : lastX;
+                const ex = (j + 1 < activeOpens.length) ? activeOpens[j + 1].x : lastX;
                 if (showZone) {
                     canvas.drawLine(pt.offset(sx, o.h), pt.offset(ex, o.h), { color: o.col, lineWidth: lw, opacity: op * 0.6 });
                     canvas.drawLine(pt.offset(sx, o.l), pt.offset(ex, o.l), { color: o.col, lineWidth: lw, opacity: op * 0.6 });
@@ -502,7 +535,13 @@ module.exports = {
         enableStrategy: predef.paramSpecs.number(1, 1, 0),  // generate signals
         tfWarning:      predef.paramSpecs.number(1, 1, 0),  // on-chart timeframe notice
 
-        // ── sessions (1 = use, 0 = ignore). Defaults: 09:29 + 18:00 ──
+        // ── sessions ──
+        // autoSession: when 1 (default), the chart timeframe picks the
+        // active session — 1m chart -> NY only, 5m chart -> EVE only, any
+        // other TF -> neither. Set to 0 for full manual control via the
+        // sessXxx toggles below. NEWS / NY PM / ASIA / LON always follow
+        // their own toggles regardless of autoSession.
+        autoSession: predef.paramSpecs.number(1, 1, 0),
         sessNY:      predef.paramSpecs.number(1, 1, 0),
         sessEvening: predef.paramSpecs.number(1, 1, 0),
         sessNewsAM:  predef.paramSpecs.number(0, 1, 0),

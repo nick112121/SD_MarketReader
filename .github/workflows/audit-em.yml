@@ -1,0 +1,31 @@
+name: EM dashboard audit
+
+# Two scheduled runs each US trading day so feed / math regressions surface
+# immediately instead of mid-session.
+#   * Morning  — ~9:40 ET (just after the 9:30 RTH open + intraday anchor latch)
+#   * Post-close — ~4:30 ET (after the cash session closes)
+# GitHub Actions cron is UTC. The schedules below cover both DST and standard
+# time generously; on a given day at most one will land in market hours.
+on:
+  schedule:
+    - cron: '40 13 * * 1-5'  # 09:40 ET in EDT / 08:40 ET in EST  — morning audit
+    - cron: '30 20 * * 1-5'  # 16:30 ET in EDT / 15:30 ET in EST  — post-close audit
+  workflow_dispatch: {}      # also runnable on demand from the Actions tab
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run audit
+        run: python audit_em.py

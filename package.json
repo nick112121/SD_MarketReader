@@ -1,0 +1,11 @@
+{
+  "name": "sd-marketreader",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tradovate indicator + Node test harness",
+  "scripts": {
+    "test":     "node tests/run-tests.js",
+    "backtest": "node tests/backtest.js",
+    "all":      "node tests/run-tests.js && node tests/backtest.js"
+  }
+}

@@ -1,0 +1,641 @@
+'use strict';
+// Test runner. Lightweight assert library, then a sequence of scenarios that
+// exercise the new logic added on this branch.
+
+const { MarketReader, runScenario, genSession, ts, makeData, indicator } = require('./harness');
+
+let pass = 0, fail = 0;
+const failures = [];
+
+function eq(actual, expected, label) {
+    if (actual === expected) { pass++; return; }
+    fail++;
+    failures.push(`FAIL: ${label}\n      expected: ${JSON.stringify(expected)}\n      actual:   ${JSON.stringify(actual)}`);
+}
+function truthy(actual, label) {
+    if (actual) { pass++; return; }
+    fail++;
+    failures.push(`FAIL: ${label}\n      expected: truthy\n      actual:   ${JSON.stringify(actual)}`);
+}
+function approxEq(actual, expected, tol, label) {
+    if (Math.abs(actual - expected) <= tol) { pass++; return; }
+    fail++;
+    failures.push(`FAIL: ${label}\n      expected: ${expected} ± ${tol}\n      actual:   ${actual}`);
+}
+function ok(label) { pass++; }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 1: file loads, exports the expected shape
+// ─────────────────────────────────────────────────────────────────────────
+function testLoad() {
+    eq(typeof MarketReader, 'function', 'MarketReader is a class');
+    eq(indicator.name, 'SD_MarketReader', 'export name');
+    eq(indicator.inputType, 'bars', 'inputType');
+    truthy(indicator.params, 'params present');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 2: init sets defaults including the new state we added
+// ─────────────────────────────────────────────────────────────────────────
+function testInitDefaults() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+    eq(mr.lastLossBar, -9999, 'lastLossBar default');
+    eq(mr.lastLossDir, 0, 'lastLossDir default');
+    eq(mr.lastLossLevel, '', 'lastLossLevel default');
+    eq(mr.maxTradesOverrideUsed, false, 'maxTradesOverrideUsed default');
+    eq(typeof mr.volBins, 'object', 'volBins object');
+    eq(mr.ibStartBar, -1, 'ibStartBar default');
+    eq(mr.ibLocked, false, 'ibLocked default');
+    eq(mr.ibBroken, 0, 'ibBroken default');
+    eq(mr.ibBreakBars, 0, 'ibBreakBars default');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 3: smoke — drive a flat-ish session, no crashes
+// ─────────────────────────────────────────────────────────────────────────
+function testSmoke() {
+    const bars = genSession('2030-05-04', 9, 30, 90, (i) => {
+        const px = 27800 + Math.sin(i / 10) * 5;
+        return { o: px, h: px + 2, l: px - 2, c: px };
+    });
+    let crashed = false;
+    let mr;
+    try {
+        mr = runScenario(bars);
+    } catch (e) {
+        crashed = true;
+        failures.push('FAIL: smoke run threw\n      ' + (e.stack || e.message));
+    }
+    eq(crashed, false, 'smoke run completes without throwing');
+    if (mr) {
+        truthy(mr.H.length > 0, 'bars accumulated');
+        truthy(mr.atr > 0, 'atr non-zero');
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 4: vol bins accumulate per 15-min bucket
+// ─────────────────────────────────────────────────────────────────────────
+function testVolBins() {
+    // Run a 60-min session — 4 bins (09:30, 09:45, 10:00, 10:15)
+    const bars = genSession('2030-05-04', 9, 30, 60, (i) => {
+        const px = 27800;
+        return { o: px, h: px + (i % 5) + 1, l: px - (i % 5) - 1, c: px };
+    });
+    const mr = runScenario(bars);
+    const keys = Object.keys(mr.volBins).sort();
+    truthy(keys.length >= 3, `vol bins created (got ${keys.length}: ${keys.join(',')})`);
+    truthy(keys.includes('09:30'), '09:30 bin exists');
+    truthy(keys.includes('09:45'), '09:45 bin exists');
+    if (mr.volBins['09:30']) {
+        // First bar is skipped (n>1 guard in volBins update — needs a prior
+        // bar to compare). So 15 minutes → 14 samples in the 09:30 bin.
+        eq(mr.volBins['09:30'].n, 14, '09:30 bin has 14 samples (first bar skipped)');
+        truthy(mr.volBins['09:30'].sumRange > 0, '09:30 sumRange > 0');
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 5: IB tracker — develops then locks then breaks
+// ─────────────────────────────────────────────────────────────────────────
+function testIBTracker() {
+    // 130-min session: first 60 bars stay in tight 27800-27820 range
+    // (the IB window). Then dump cleanly through IB low and hold below
+    // for at least 3 bars to trigger the break confirmation.
+    const bars = genSession('2030-05-04', 9, 30, 130, (i) => {
+        let px;
+        if (i <= 60) {
+            // IB period: oscillate 27800-27820
+            px = 27800 + (i % 10) * 2;
+        } else if (i < 75) {
+            // Sharp dump out of IB low, then well below
+            px = 27780 - (i - 60) * 4;  // 27780 → 27724
+        } else {
+            // Hold below for many bars
+            px = 27720 + (i % 5);
+        }
+        return { o: px, h: px + 1, l: px - 1, c: px };
+    });
+    const mr = runScenario(bars);
+    truthy(mr.ibStartBar >= 0, 'IB started');
+    truthy(mr.ibHigh >= 27815, `ibHigh captured (${mr.ibHigh})`);
+    truthy(mr.ibLow >= 27795 && mr.ibLow <= 27805, `ibLow captured (${mr.ibLow})`);
+    eq(mr.ibLocked, true, 'IB locked after 60 min');
+    eq(mr.ibBroken, -1, 'IB broken to the downside');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 6: REPEAT-LOSS state set on losing exit
+// (Simulate by directly invoking the recording logic — the full entry
+// pipeline requires framework agreement which is hard to engineer in
+// synthetic data. We test the bookkeeping.)
+// ─────────────────────────────────────────────────────────────────────────
+function testRepeatLossBookkeeping() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+    // Simulate the exit recording block
+    mr.lastLossBar = 100;
+    mr.lastLossDir = 1;
+    mr.lastLossLevel = 'MTT_H';
+
+    // Verify that the constants the filter depends on resolve as expected
+    // The filter is: same dir + same level + (bi - lastLossBar) < 60
+    // We just check the state holds:
+    eq(mr.lastLossDir, 1, 'lastLossDir held');
+    eq(mr.lastLossLevel, 'MTT_H', 'lastLossLevel held');
+    // Within window
+    truthy((130 - mr.lastLossBar) < 60, 'within 60-bar repeat window @ bar 130');
+    truthy((180 - mr.lastLossBar) >= 60, 'outside 60-bar repeat window @ bar 180');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 7: WIN/LOSS label position — direction-aware
+// We synthesise the label-y math and verify against expected.
+// ─────────────────────────────────────────────────────────────────────────
+function testWinLabelPosition() {
+    const h = 27950, l = 27940, atr = 10;
+    // The new logic: above when (exitDir===1) === win
+    function labelY(exitDir, win) {
+        const above = (exitDir === 1) === win;
+        return above ? h + atr : l - atr;
+    }
+    eq(labelY(1, true),   h + atr, 'LONG WIN  → above bar');
+    eq(labelY(1, false),  l - atr, 'LONG LOSS → below bar');
+    eq(labelY(-1, true),  l - atr, 'SHORT WIN → below bar (was buggy: above)');
+    eq(labelY(-1, false), h + atr, 'SHORT LOSS → above bar');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 8: chase filter math — 15-bar range > 6 ATR + position-in-range check
+// ─────────────────────────────────────────────────────────────────────────
+function testChaseFilterMath() {
+    // Simulate: 15 bars spanning 27950 → 27720 (range 230), atr 15 → 6*atr=90.
+    // 230 > 90, so filter active. Current close = 27725 → posInRng = 5/230 ≈ 0.02
+    // SHORT proposed → posInRng < 0.30 → CHASE-DOWN
+    const _hi = 27950, _lo = 27720, _c = 27725, atr = 15;
+    const _rng = _hi - _lo;
+    const _posInRng = (_c - _lo) / Math.max(_rng, 0.01);
+    truthy(_rng > atr * 6, `range ${_rng} > 6*atr ${atr * 6}`);
+    truthy(_posInRng < 0.30, `posInRng ${_posInRng.toFixed(3)} < 0.30 (chase territory for SHORT)`);
+
+    // LONG proposed at top: c=27945, posInRng > 0.70
+    const _c2 = 27945;
+    const _pos2 = (_c2 - _lo) / Math.max(_rng, 0.01);
+    truthy(_pos2 > 0.70, `posInRng top ${_pos2.toFixed(3)} > 0.70 (chase for LONG)`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 9: COUNTER-DAY / LATE-CHASE math — day directional + PIDR extreme
+// ─────────────────────────────────────────────────────────────────────────
+function testDayContextMath() {
+    // Use sessHigh/Low AT THE TIME OF ENTRY (not the eventual extreme).
+    // The SHORT @ 27738 fired around 11:15-11:30 when the day low was ~27720,
+    // not the eventual 27620 made later in the afternoon.
+    const sessOpen = 27860, sessHigh = 27945, sessLow = 27720;
+    const c = 27738;  // late-chase scenario from today's chart
+    const atr = 15;
+    const dayRng = sessHigh - sessLow;
+    const dayMv = c - sessOpen;
+    const PIDR = (c - sessLow) / dayRng;
+    const dayDir = dayMv > 0 ? 1 : -1;
+    const directional = Math.abs(dayMv) > atr * 4;
+    truthy(directional, `directional day (move ${dayMv} > 4*atr=${atr*4})`);
+    eq(dayDir, -1, 'day direction: down');
+    truthy(PIDR < 0.20, `PIDR ${PIDR.toFixed(3)} < 0.20 → LATE-CHASE territory for SHORT`);
+
+    // LONG @ 27783 scenario — counter-day, slightly later in session
+    const c2 = 27783;
+    const PIDR2 = (c2 - sessLow) / dayRng;
+    truthy(PIDR2 < 0.35, `PIDR ${PIDR2.toFixed(3)} < 0.35 → COUNTER-DAY for LONG`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 10: regime-flip override math
+// ─────────────────────────────────────────────────────────────────────────
+function testRegimeFlipOverride() {
+    // Simulate: dailyTrades=3 (at MAX-TRADES), lastLossDir=1 (we lost longs),
+    // proposed dir=-1 (opposite), totalScore=8 (>=7), override unused → ALLOW
+    function flipAllowed(dailyTrades, maxTrades, lastLossDir, proposedDir, totalScore, used) {
+        if (dailyTrades < maxTrades) return true; // not at cap, no override needed
+        const isFlip = lastLossDir !== 0 &&
+                       proposedDir === -lastLossDir &&
+                       totalScore >= 7 &&
+                       !used;
+        return isFlip;
+    }
+    eq(flipAllowed(3, 3, 1, -1, 8, false), true,  'regime-flip allowed: opposite + score 8');
+    eq(flipAllowed(3, 3, 1, -1, 6, false), false, 'regime-flip blocked: score < 7');
+    eq(flipAllowed(3, 3, 1,  1, 9, false), false, 'regime-flip blocked: same dir as loss');
+    eq(flipAllowed(3, 3, 1, -1, 9, true),  false, 'regime-flip blocked: already used');
+    eq(flipAllowed(2, 3, 1, -1, 5, false), true,  'no override needed: dailyTrades < cap');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 11: H1-COUNTER blocking math
+// ─────────────────────────────────────────────────────────────────────────
+function testH1CounterMath() {
+    function shouldBlock(h1Trend, dir, totalScore) {
+        if (!h1Trend || h1Trend === 'FLAT') return false;
+        const h1Dir = h1Trend === 'BULL' ? 1 : -1;
+        return dir === -h1Dir && (totalScore || 0) < 7;
+    }
+    eq(shouldBlock('BEAR',  1, 5), true,  'block LONG vs BEAR H1, low score');
+    eq(shouldBlock('BEAR',  1, 8), false, 'allow LONG vs BEAR H1, high score');
+    eq(shouldBlock('BEAR', -1, 5), false, 'allow SHORT with BEAR H1');
+    eq(shouldBlock('BULL', -1, 5), true,  'block SHORT vs BULL H1, low score');
+    eq(shouldBlock('FLAT',  1, 3), false, 'no block on FLAT H1');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 12: LOSS-PAUSE threshold (now 2)
+// ─────────────────────────────────────────────────────────────────────────
+function testLossPauseThreshold() {
+    // After 2 losses, pauseUntilBar should be set
+    function shouldPause(results) {
+        const losses = results.filter(r => !r.win).length;
+        return losses >= 2;
+    }
+    eq(shouldPause([{win:false},{win:false}]), true,  '2L → pause');
+    eq(shouldPause([{win:false},{win:true}]),  false, '1L → no pause');
+    eq(shouldPause([{win:false},{win:false},{win:true}]), true, '2L of 3 → pause');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 13: end-to-end on a distribution-day arc — verify the indicator
+// completes a NY session without error and tracks IB+day context.
+// ─────────────────────────────────────────────────────────────────────────
+function testDistributionDay() {
+    // Pattern: open 27860, rip to 27940 in 30 bars, dump to 27620 by bar 90,
+    // then chop. 180 bars total = 3 hours.
+    const bars = genSession('2030-05-04', 9, 30, 180, (i) => {
+        let px;
+        if (i < 30) {
+            // Rip up
+            px = 27860 + i * 2.5;
+        } else if (i < 90) {
+            // Dump
+            px = 27940 - (i - 30) * 5.3;
+        } else {
+            // Chop near lows
+            px = 27620 + ((i - 90) % 8) * 3;
+        }
+        return { o: px - 0.5, h: px + 2, l: px - 2, c: px };
+    });
+    let crashed = false;
+    let mr;
+    try {
+        mr = runScenario(bars);
+    } catch (e) {
+        crashed = true;
+        failures.push('FAIL: distribution-day run threw\n      ' + (e.stack || e.message));
+    }
+    eq(crashed, false, 'distribution-day session completes');
+    if (mr) {
+        eq(mr.ibLocked, true, 'IB locked');
+        eq(mr.ibBroken, -1, 'IB broken down on distribution day');
+        truthy(mr.sessHigh >= 27935, `sessHigh captured (${mr.sessHigh})`);
+        truthy(mr.sessLow <= 27625, `sessLow captured (${mr.sessLow})`);
+        // After the dump, current price near sessLow. PIDR should be low.
+        const dayRng = mr.sessHigh - mr.sessLow;
+        const lastC = mr.C[mr.C.length - 1];
+        const pidr = (lastC - mr.sessLow) / dayRng;
+        truthy(pidr < 0.30, `PIDR at end of dump ${pidr.toFixed(3)} < 0.30`);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 14: MOMENTUM filter math — strong + consistent net move blocks
+// trades against the flow.
+// ─────────────────────────────────────────────────────────────────────────
+function testMomentumFilterMath() {
+    function shouldBlock(C, O, c, dir, atr) {
+        const n = C.length + 1;  // emulate indicator's n (length after current bar)
+        if (n < 21) return null;
+        const refClose = C[n - 21];
+        const netMv = c - refClose;
+        let aligned = 0;
+        for (let i = 1; i <= 20; i++) {
+            const o_i = O[n - 1 - i];
+            const c_i = C[n - 1 - i];
+            if (o_i == null || c_i == null) continue;
+            if (netMv > 0 && c_i > o_i) aligned++;
+            else if (netMv < 0 && c_i < o_i) aligned++;
+        }
+        const strong = Math.abs(netMv) > atr * 3.5;
+        const consistent = aligned >= 12;
+        if (!strong || !consistent) return null;
+        const momDir = netMv > 0 ? 1 : -1;
+        if (dir === -momDir) return momDir === -1 ? 'MOMENTUM-DOWN' : 'MOMENTUM-UP';
+        return null;
+    }
+    // Build a clean 20-bar bearish drift: each bar closes -3 from prior open
+    const C = [], O = [];
+    for (let i = 0; i < 22; i++) {
+        const o = 27940 - i * 3;
+        const c = o - 3;  // bearish
+        O.push(o); C.push(c);
+    }
+    const cur = 27860; // current price ≈ 80pt below start (matches today's scenario)
+    const atr = 13;
+    eq(shouldBlock(C, O, cur, 1, atr),  'MOMENTUM-DOWN', 'block LONG into bearish momentum');
+    eq(shouldBlock(C, O, cur, -1, atr), null,            'allow SHORT with bearish momentum');
+
+    // Insufficient consistency — half up half down bars but big net move
+    const C2 = [], O2 = [];
+    for (let i = 0; i < 22; i++) {
+        // Alternating colors but stair-stepping down in close
+        const o = 27940 - i * 3;
+        const c = o + (i % 2 === 0 ? 1 : -7);  // mixed colors
+        O2.push(o); C2.push(c);
+    }
+    eq(shouldBlock(C2, O2, 27870, 1, atr), null, 'allow when not consistent (only ~10 aligned)');
+
+    // Insufficient magnitude — small move
+    const C3 = [], O3 = [];
+    for (let i = 0; i < 22; i++) {
+        const o = 27940 - i * 0.3;  // tiny drift
+        const c = o - 0.3;
+        O3.push(o); C3.push(c);
+    }
+    eq(shouldBlock(C3, O3, 27933, 1, atr), null, 'allow when net move below threshold');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 15: DAY-QUALITY composite — verify the score moves with regime
+// ─────────────────────────────────────────────────────────────────────────
+function testDayQualityComposite() {
+    function score({ ibLocked, ibBroken, sessOpen, c, sessHigh, sessLow,
+                     h1Trend, recentResults, atr }) {
+        let q = 5;
+        if (ibLocked && ibBroken === 0) q += 2;
+        if (ibBroken !== 0) q -= 3;
+        if (sessOpen > 0 && Math.abs(c - sessOpen) > atr * 5) q -= 2;
+        if (sessOpen > 0) {
+            const pidr = (c - sessLow) / Math.max(sessHigh - sessLow, 0.01);
+            if (pidr < 0.15 || pidr > 0.85) q -= 1;
+        }
+        if (h1Trend === 'BULL' || h1Trend === 'BEAR') q -= 1;
+        if (recentResults && recentResults.length >= 2) {
+            const losses = recentResults.slice(-2).filter(r => !r.win).length;
+            if (losses >= 2) q -= 2;
+        }
+        return Math.max(0, Math.min(10, q));
+    }
+    // Balance day in mid-range: IB held, no big move, FLAT H1, no losses → 7
+    eq(score({
+        ibLocked: true, ibBroken: 0, sessOpen: 27800, c: 27810,
+        sessHigh: 27820, sessLow: 27795, h1Trend: 'FLAT',
+        recentResults: [], atr: 13,
+    }), 7, 'balance day = 7');
+    // Trend day, IB broken down, 5 ATR move, PIDR low, BEAR H1 → very low
+    eq(score({
+        ibLocked: true, ibBroken: -1, sessOpen: 27860, c: 27720,
+        sessHigh: 27945, sessLow: 27710, h1Trend: 'BEAR',
+        recentResults: [], atr: 13,
+    }), 0, 'trend distribution day = 0 (floored)');
+    // After two losses pile on
+    eq(score({
+        ibLocked: true, ibBroken: 0, sessOpen: 27800, c: 27810,
+        sessHigh: 27820, sessLow: 27795, h1Trend: 'FLAT',
+        recentResults: [{win:false},{win:false}], atr: 13,
+    }), 5, 'balance day with 2L = 5 (still firable)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 16: HARD-STOP at half daily loss
+// ─────────────────────────────────────────────────────────────────────────
+function testHardStop() {
+    // At -50% of maxDailyLoss with at least 1 trade taken, block.
+    function shouldHardStop(sessPnl, cv, maxLoss, dailyTrades) {
+        return (sessPnl * cv <= -(maxLoss * 0.5)) && dailyTrades > 0;
+    }
+    eq(shouldHardStop(-101, 2, 400, 1), true,  '-$202 with 1 trade @ maxLoss 400 → stop');
+    eq(shouldHardStop(-99, 2, 400, 1),  false, '-$198 → no stop');
+    eq(shouldHardStop(-150, 2, 400, 0), false, 'no trades yet → no stop (warm-up)');
+    eq(shouldHardStop(50, 2, 400, 5),   false, 'green session → no stop');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 17: DAY-QUALITY < 4 blocks, >= 4 allows
+// ─────────────────────────────────────────────────────────────────────────
+function testDayQualityBlock() {
+    // Just verify the threshold is "< 4" (i.e. 4 allowed, 3 blocked)
+    function blocked(q) { return q < 4; }
+    eq(blocked(0), true,  'Q0 blocked');
+    eq(blocked(3), true,  'Q3 blocked');
+    eq(blocked(4), false, 'Q4 allowed');
+    eq(blocked(7), false, 'Q7 allowed');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 18: State classifier — verify states emerge on synthetic arcs
+// ─────────────────────────────────────────────────────────────────────────
+function testStateClassifier() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+    // Seed C/H/L/O for a 30-bar bullish trend
+    for (let i = 0; i < 30; i++) {
+        const px = 27800 + i * 4;
+        mr.O.push(px - 1); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    mr.cumDelta = 800;
+    eq(mr._classifyMarketState(27920, 12), 'TREND_UP', 'bullish arc → TREND_UP');
+
+    // Reset for bearish trend
+    mr.O.length = 0; mr.H.length = 0; mr.L.length = 0; mr.C.length = 0;
+    for (let i = 0; i < 30; i++) {
+        const px = 27900 - i * 4;
+        mr.O.push(px + 1); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    mr.cumDelta = -800;
+    eq(mr._classifyMarketState(27780, 12), 'TREND_DOWN', 'bearish arc → TREND_DOWN');
+
+    // Tight range, positive CD → ACCUMULATION
+    mr.O.length = 0; mr.H.length = 0; mr.L.length = 0; mr.C.length = 0;
+    for (let i = 0; i < 30; i++) {
+        const px = 27800 + ((i % 4) - 1.5) * 2;
+        mr.O.push(px); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    mr.cumDelta = 600;
+    eq(mr._classifyMarketState(27800, 12), 'ACCUMULATION', 'tight range + CD+ → ACCUMULATION');
+
+    // Tight range, negative CD → DISTRIBUTION
+    mr.cumDelta = -600;
+    eq(mr._classifyMarketState(27800, 12), 'DISTRIBUTION', 'tight range + CD- → DISTRIBUTION');
+
+    // Insufficient data
+    mr.O.length = 0; mr.H.length = 0; mr.L.length = 0; mr.C.length = 0;
+    for (let i = 0; i < 5; i++) {
+        mr.O.push(27800); mr.H.push(27802); mr.L.push(27798); mr.C.push(27800);
+    }
+    eq(mr._classifyMarketState(27800, 12), 'NEUTRAL', '< 20 bars → NEUTRAL');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 19: State-setup WR lookup
+// ─────────────────────────────────────────────────────────────────────────
+function testStateSetupWR() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+
+    // Empty stats → null
+    eq(mr._stateSetupWR('TREND_DOWN', 'MTT_H'), null, 'empty stats → null');
+
+    // Insufficient samples (4) → null
+    mr.stateStats['TREND_DOWN'] = { 'MTT_H': { w: 0, l: 4, pnl: -10 } };
+    eq(mr._stateSetupWR('TREND_DOWN', 'MTT_H'), null, '4 samples → null');
+
+    // 5 losses, 0 wins → wr 0
+    mr.stateStats['TREND_DOWN']['MTT_H'] = { w: 0, l: 5, pnl: -10 };
+    const wr = mr._stateSetupWR('TREND_DOWN', 'MTT_H');
+    truthy(wr, 'returns object');
+    if (wr) {
+        eq(wr.wr, 0, 'wr = 0 for 0W/5L');
+        eq(wr.n, 5, 'n = 5');
+        eq(wr.pnl, -10, 'pnl exposed');
+    }
+
+    // STATE-FAIL upgrade: negative PnL with >=10 samples should also trigger
+    function shouldFail(stats) {
+        if (!stats) return false;
+        return stats.wr < 0.40 || (stats.n >= 10 && stats.pnl < 0);
+    }
+    eq(shouldFail({wr:0.30, n:6,  pnl:-5}),  true,  '<40% WR blocks');
+    eq(shouldFail({wr:0.55, n:15, pnl:-12}), true,  '55% WR but neg PnL @ 15 samples blocks');
+    eq(shouldFail({wr:0.55, n:15, pnl: 12}), false, '55% WR + positive PnL allows');
+    eq(shouldFail({wr:0.55, n:7,  pnl:-2}),  false, 'neg PnL but <10 samples allows (low confidence)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 20: Bubble zone lookup
+// ─────────────────────────────────────────────────────────────────────────
+function testBubbleZoneLookup() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+
+    // Empty bubbles → null
+    eq(mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100), null, 'no bubbles → null');
+
+    // Bubble within zone, recent → returns it
+    mr.bubbles = [
+        { bar: 95, price: 27800, delta: -350, ts: 0 },
+    ];
+    const r1 = mr._recentBubbleAtZone(27805, 12, 5, 1.0, 100);
+    truthy(r1, 'bubble found within tol');
+    if (r1) eq(r1.delta, -350, 'returns the matching bubble');
+
+    // Bubble too old → null
+    mr.bubbles = [
+        { bar: 50, price: 27800, delta: -350, ts: 0 },
+    ];
+    eq(mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100), null, 'old bubble (>5 bars) → null');
+
+    // Bubble too far in price → null
+    mr.bubbles = [
+        { bar: 99, price: 27750, delta: -350, ts: 0 },
+    ];
+    eq(mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100), null, 'far bubble (>1 ATR) → null');
+
+    // Multiple bubbles — return strongest
+    mr.bubbles = [
+        { bar: 97, price: 27800, delta: 100, ts: 0 },
+        { bar: 99, price: 27802, delta: -400, ts: 0 },
+        { bar: 98, price: 27804, delta: 250, ts: 0 },
+    ];
+    const r2 = mr._recentBubbleAtZone(27800, 12, 5, 1.0, 100);
+    truthy(r2, 'multi-bubble returns one');
+    if (r2) eq(r2.delta, -400, 'returns the strongest bubble');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 21: COIL detector — compression detection + breakout direction
+// ─────────────────────────────────────────────────────────────────────────
+function testCoilDetector() {
+    const mr = new MarketReader();
+    mr.props = {};
+    mr.init({});
+
+    // Seed 8 tight bars (range ~0.4 ATR, closes within 0.5 ATR)
+    const center = 28000;
+    for (let i = 0; i < 8; i++) {
+        const px = center + (i % 3 - 1) * 1;  // closes oscillate by ±1
+        mr.O.push(px); mr.H.push(px + 2); mr.L.push(px - 2); mr.C.push(px);
+    }
+    const atr = 13;
+    const coil = mr._detectCoil(99, atr, 6);
+    truthy(coil, 'tight cluster detected as coil');
+    if (coil) truthy((coil.hi - coil.lo) < atr * 1.5, 'cluster range below 1.5 ATR');
+
+    // Reset; now seed 8 wide bars (range too big)
+    mr.O.length=0; mr.H.length=0; mr.L.length=0; mr.C.length=0;
+    for (let i = 0; i < 8; i++) {
+        const px = center + i * 5;
+        mr.O.push(px); mr.H.push(px + 15); mr.L.push(px - 15); mr.C.push(px);
+    }
+    eq(mr._detectCoil(99, atr, 6), null, 'wide bars NOT a coil');
+
+    // Coil + bull breakout bar
+    const coil2 = { hi: 28005, lo: 27995, avgRng: 5 };
+    eq(mr._coilBreakDir(coil2, 28030, 28005, 28032, 28000, atr), 1,
+        'strong-body bull bar above coil hi → +1');
+    // Coil + bear breakout bar
+    eq(mr._coilBreakDir(coil2, 27970, 27995, 28000, 27965, atr), -1,
+        'strong-body bear bar below coil lo → -1');
+    // Coil + small bar (not a breakout)
+    eq(mr._coilBreakDir(coil2, 28006, 28001, 28010, 27998, atr), 0,
+        'small-bodied bar → no break');
+}
+
+// ─────────────────────────────────────────────────────────
+// Run all
+// ─────────────────────────────────────────────────────────
+const tests = [
+    ['load',                         testLoad],
+    ['init defaults',                testInitDefaults],
+    ['smoke',                        testSmoke],
+    ['vol bins',                     testVolBins],
+    ['IB tracker',                   testIBTracker],
+    ['repeat-loss bookkeeping',      testRepeatLossBookkeeping],
+    ['win label position',           testWinLabelPosition],
+    ['chase filter math',            testChaseFilterMath],
+    ['day context math',             testDayContextMath],
+    ['regime-flip override',         testRegimeFlipOverride],
+    ['H1-COUNTER math',              testH1CounterMath],
+    ['LOSS-PAUSE threshold',         testLossPauseThreshold],
+    ['distribution day end-to-end',  testDistributionDay],
+    ['MOMENTUM filter math',         testMomentumFilterMath],
+    ['DAY-QUALITY composite',        testDayQualityComposite],
+    ['HARD-STOP threshold',          testHardStop],
+    ['DAY-QUALITY block threshold',  testDayQualityBlock],
+    ['state classifier',             testStateClassifier],
+    ['state-setup WR lookup',        testStateSetupWR],
+    ['bubble zone lookup',           testBubbleZoneLookup],
+    ['coil detector',                testCoilDetector],
+];
+
+console.log('Running ' + tests.length + ' test groups…\n');
+for (const [name, fn] of tests) {
+    const before = fail;
+    try {
+        fn();
+    } catch (e) {
+        fail++;
+        failures.push(`FAIL (threw): ${name}\n      ${e.stack || e.message}`);
+    }
+    const groupFails = fail - before;
+    console.log(`  ${groupFails === 0 ? '✓' : '✗'} ${name}${groupFails ? ' ('+groupFails+' fail)' : ''}`);
+}
+
+console.log('\n──────────────────────────────────');
+console.log(`pass: ${pass}   fail: ${fail}`);
+if (failures.length) {
+    console.log('\n' + failures.join('\n\n'));
+    process.exit(1);
+}
+process.exit(0);

@@ -84,10 +84,29 @@ SECTOR_ETFS = [
 ]
 
 import math
+import concurrent.futures as _cf
 # ATM straddle × √(π/2) = 1-σ expected move. This is the convention every
 # major EM tracker (impliedopen etc.) uses, and the factor cleanly converts
 # the straddle price into the theoretical 1-σ band.
 SQRT_PI_2 = math.sqrt(math.pi / 2)
+
+# Shared pool for two purposes:
+# 1. Per-call timeout enforcement (main thread submits a yfinance call and
+#    waits at most N seconds — prevents a single frozen Yahoo request from
+#    blocking the whole compute() forever).
+# 2. Parallel option-chain fetches inside compute_weekly_range,
+#    _compute_weekly_underlyings, and compute_gamma.
+#
+# IMPORTANT: _tf() must NOT be called from within a task already running
+# inside _TIMEOUT_POOL — that would create nested submissions and risk
+# thread-starvation deadlock. The parallel helper functions (_one closures)
+# therefore call yfinance directly without going through _tf.
+_TIMEOUT_POOL = _cf.ThreadPoolExecutor(max_workers=20, thread_name_prefix="yf")
+
+
+def _tf(fn, *args, timeout: float = 12.0, **kwargs):
+    """Run fn(*args, **kwargs) in _TIMEOUT_POOL; raise TimeoutError after timeout s."""
+    return _TIMEOUT_POOL.submit(fn, *args, **kwargs).result(timeout=timeout)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -209,12 +228,11 @@ def compute_weekly_range(fut_intra) -> dict:
     a {code: emW} map the intraday section can use for σW math."""
     now_et = pd.Timestamp.now(tz=ET)
     target = _next_friday_str(now_et)
-    rows = []
     em_map: dict[str, int] = {}
-    for code, fsym, etf, name in WEEKLY_RANGE_MARKETS:
+
+    def _one(code, fsym, etf, name):
+        # Runs inside _TIMEOUT_POOL — do NOT call _tf() here.
         try:
-            # Current futures price — from the cached intraday set if present,
-            # else a quick daily pull for GC which isn't in the main MARKETS.
             if fsym in fut_intra.columns.get_level_values(0):
                 cur_s = fut_intra[fsym]["Close"].dropna()
                 cur_fut = float(cur_s.iloc[-1]) if len(cur_s) else None
@@ -230,28 +248,40 @@ def compute_weekly_range(fut_intra) -> dict:
             except Exception:
                 cur_etf = float(t.history(period="1d")["Close"].iloc[-1])
             if not cur_fut or cur_etf <= 0:
-                rows.append({"code": code, "name": name, "error": "no price"})
-                continue
+                return {"code": code, "name": name, "error": "no price"}, None
             straddle, exp = _atm_straddle_mid(etf, target, cur_etf)
             if straddle is None or straddle <= 0:
-                rows.append({"code": code, "name": name, "error": "no option chain"})
-                continue
+                return {"code": code, "name": name, "error": "no option chain"}, None
             ratio = cur_fut / cur_etf
-            em_fut = straddle * SQRT_PI_2 * ratio  # 1-σ in futures terms
-            em_map[code] = int(round(em_fut))
-            rows.append({
+            em_fut = straddle * SQRT_PI_2 * ratio
+            em_w_int = int(round(em_fut))
+            return {
                 "code": code, "name": name,
                 "anchor": round(cur_fut, 2),
                 "low":    round(cur_fut - em_fut, 2),
                 "high":   round(cur_fut + em_fut, 2),
-                "emW":    int(round(em_fut)),
+                "emW":    em_w_int,
                 "etf": etf, "etfPx": round(cur_etf, 2),
                 "straddle": round(straddle, 2),
                 "ratio": round(ratio, 2),
                 "expiry": exp,
-            })
+            }, (code, em_w_int)
         except Exception as e:
-            rows.append({"code": code, "name": name, "error": str(e)})
+            return {"code": code, "name": name, "error": str(e)}, None
+
+    futs = {_TIMEOUT_POOL.submit(_one, code, fsym, etf, name): (code, name)
+            for code, fsym, etf, name in WEEKLY_RANGE_MARKETS}
+    rows_by_code: dict[str, dict] = {}
+    for fut, (code, name) in futs.items():
+        try:
+            row, em_entry = fut.result(timeout=30)
+            rows_by_code[code] = row
+            if em_entry:
+                em_map[em_entry[0]] = em_entry[1]
+        except _cf.TimeoutError:
+            rows_by_code[code] = {"code": code, "name": name, "error": "timeout"}
+    rows = [rows_by_code.get(m[0], {"code": m[0], "name": m[3], "error": "missing"})
+            for m in WEEKLY_RANGE_MARKETS]
     return {"targetFriday": target, "rows": rows, "emMap": em_map}
 
 
@@ -261,8 +291,9 @@ def _compute_weekly_underlyings(items: list[tuple[str, str]]) -> dict:
     sector ETFs — for stocks the underlying IS the ticker, no proxy."""
     now_et = pd.Timestamp.now(tz=ET)
     target = _next_friday_str(now_et)
-    rows = []
-    for sym, name in items:
+
+    def _one(sym, name):
+        # Runs inside _TIMEOUT_POOL — do NOT call _tf() here.
         try:
             t = yf.Ticker(sym)
             try:
@@ -271,14 +302,12 @@ def _compute_weekly_underlyings(items: list[tuple[str, str]]) -> dict:
             except Exception:
                 cur = float(t.history(period="1d")["Close"].iloc[-1])
             if not cur or cur <= 0:
-                rows.append({"sym": sym, "name": name, "error": "no price"})
-                continue
+                return {"sym": sym, "name": name, "error": "no price"}
             straddle, exp = _atm_straddle_mid(sym, target, cur)
             if straddle is None or straddle <= 0:
-                rows.append({"sym": sym, "name": name, "error": "no option chain"})
-                continue
+                return {"sym": sym, "name": name, "error": "no option chain"}
             em = straddle * SQRT_PI_2
-            rows.append({
+            return {
                 "sym": sym, "name": name,
                 "anchor": round(cur, 2),
                 "low":    round(cur - em, 2),
@@ -286,9 +315,19 @@ def _compute_weekly_underlyings(items: list[tuple[str, str]]) -> dict:
                 "emW":    round(em, 2),
                 "straddle": round(straddle, 2),
                 "expiry": exp,
-            })
+            }
         except Exception as e:
-            rows.append({"sym": sym, "name": name, "error": str(e)})
+            return {"sym": sym, "name": name, "error": str(e)}
+
+    futs = {_TIMEOUT_POOL.submit(_one, sym, name): (sym, name) for sym, name in items}
+    rows_by_sym: dict[str, dict] = {}
+    for fut, (sym, name) in futs.items():
+        try:
+            rows_by_sym[sym] = fut.result(timeout=30)
+        except _cf.TimeoutError:
+            rows_by_sym[sym] = {"sym": sym, "name": name, "error": "timeout"}
+    rows = [rows_by_sym.get(sym, {"sym": sym, "name": name, "error": "missing"})
+            for sym, name in items]
     return {"targetFriday": target, "rows": rows}
 
 
@@ -321,19 +360,20 @@ def compute_daily_em_nq(fut_intra) -> dict:
             s = fut_intra["NQ=F"]["Close"].dropna()
             cur_nq = float(s.iloc[-1]) if len(s) else None
         else:
-            d = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=True)
+            d = _tf(yf.download, "NQ=F", period="5d", interval="1d",
+                    progress=False, auto_adjust=True, timeout=15)
             v = d["Close"].iloc[-1]
             cur_nq = float(v.item() if hasattr(v, "item") else v)
         t = yf.Ticker("QQQ")
         try:
-            cur_qqq = float(t.fast_info.get("lastPrice") or
-                            t.fast_info.get("regularMarketPrice"))
+            cur_qqq = float(_tf(lambda: t.fast_info.get("lastPrice") or
+                                t.fast_info.get("regularMarketPrice"), timeout=8))
         except Exception:
-            cur_qqq = float(t.history(period="1d")["Close"].iloc[-1])
+            cur_qqq = float(_tf(lambda: t.history(period="1d")["Close"].iloc[-1], timeout=12))
         if not cur_nq or not cur_qqq or cur_qqq <= 0:
             return {"market": "NQ", "ratio": None, "anchor": None, "rows": [{"error": "no price"}]}
         ratio = cur_nq / cur_qqq
-        exps_avail = set(t.options or [])
+        exps_avail = set(_tf(lambda: t.options or [], timeout=10))
     except Exception as e:
         return {"market": "NQ", "ratio": None, "anchor": None, "rows": [{"error": str(e)}]}
 
@@ -345,7 +385,7 @@ def compute_daily_em_nq(fut_intra) -> dict:
             rows.append({"day": day_name, "date": dstr, "error": "no expiry (holiday?)"})
             continue
         try:
-            oc = t.option_chain(dstr)
+            oc = _tf(t.option_chain, dstr, timeout=12)
             if oc.calls.empty or oc.puts.empty:
                 rows.append({"day": day_name, "date": dstr, "error": "empty chain"})
                 continue
@@ -568,14 +608,13 @@ def compute_open_range(fut_intra, intraday_rows):
 
 
 def compute_gamma():
-    rows = []
-    for tkr in GAMMA_TICKERS:
+    def _one(tkr):
+        # Runs inside _TIMEOUT_POOL — do NOT call _tf() here.
         try:
             t = yf.Ticker(tkr)
             exps = t.options
             if not exps:
-                rows.append({"ticker": tkr, "error": "no expirations"})
-                continue
+                return {"ticker": tkr, "error": "no expirations"}
             exp = exps[0]
             oc = t.option_chain(exp)
             try:
@@ -600,8 +639,6 @@ def compute_gamma():
             put_wall  = float(pw_row["strike"]) if pw_row is not None else None
             put_oi    = int(pw_row["openInterest"]) if pw_row is not None else 0
 
-            # ── Position vs the walls ─────────────────────────────────────
-            # "At" the wall = within 0.5% of the strike (≈ a few pts on SPY/QQQ).
             position = position_short = "—"
             position_color = "#888"
             dist_cw = dist_pw = pct_in_range = None
@@ -634,7 +671,7 @@ def compute_gamma():
                     position_short = "BETWEEN"
                     position_color = "#00cc88"
 
-            rows.append({
+            return {
                 "ticker": tkr, "expiry": exp, "price": round(cur, 2),
                 "callWall": call_wall, "callOI": call_oi,
                 "putWall":  put_wall,  "putOI":  put_oi,
@@ -642,10 +679,18 @@ def compute_gamma():
                 "positionColor": position_color,
                 "distCallWall": dist_cw, "distPutWall": dist_pw,
                 "pctInRange": pct_in_range,
-            })
+            }
         except Exception as e:
-            rows.append({"ticker": tkr, "error": str(e)})
-    return rows
+            return {"ticker": tkr, "error": str(e)}
+
+    futs = {_TIMEOUT_POOL.submit(_one, tkr): tkr for tkr in GAMMA_TICKERS}
+    results: dict[str, dict] = {}
+    for fut, tkr in futs.items():
+        try:
+            results[tkr] = fut.result(timeout=25)
+        except _cf.TimeoutError:
+            results[tkr] = {"ticker": tkr, "error": "timeout"}
+    return [results.get(tkr, {"ticker": tkr, "error": "missing"}) for tkr in GAMMA_TICKERS]
 
 
 # ── top-level ─────────────────────────────────────────────────────────────
@@ -655,12 +700,12 @@ def compute():
     vol_syms = [m[2] for m in MARKETS]
     cash_syms = [m[3] for m in MARKETS] + [g[1] for g in GLOBAL_IDX]
 
-    fut_intra = yf.download(fut_syms, period="5d", interval="5m",
-                            group_by="ticker", progress=False, auto_adjust=True)
-    daily = yf.download(fut_syms + vol_syms, period="2mo", interval="1d",
-                        group_by="ticker", progress=False, auto_adjust=True)
-    cash_daily = yf.download(cash_syms, period="5d", interval="1d",
-                             group_by="ticker", progress=False, auto_adjust=True)
+    fut_intra = _tf(yf.download, fut_syms, period="5d", interval="5m",
+                    group_by="ticker", progress=False, auto_adjust=True, timeout=45)
+    daily = _tf(yf.download, fut_syms + vol_syms, period="2mo", interval="1d",
+                group_by="ticker", progress=False, auto_adjust=True, timeout=45)
+    cash_daily = _tf(yf.download, cash_syms, period="5d", interval="1d",
+                     group_by="ticker", progress=False, auto_adjust=True, timeout=45)
 
     # Weekly EM first so the intraday section can use the option-implied
     # value (matches impliedopen.com etc.) for emW instead of √5 × daily.

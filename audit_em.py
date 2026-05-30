@@ -127,6 +127,25 @@ def run_audit() -> tuple[int, list[str], list[str], list[str]]:
             WARN(f"gamma {r['ticker']}: no position computed")
         OK(f"gamma {r['ticker']}: px {px}  CW {cw}  PW {pw} → {r.get('positionShort')}")
 
+    # ── weekly range (1-σ from ATM straddle)
+    wk = d.get("weekly", {})
+    if not isinstance(wk, dict) or "rows" not in wk:
+        FAIL("weekly: missing rows")
+    else:
+        for r in wk.get("rows", []):
+            if "error" in r:
+                WARN(f"weekly {r.get('code')}: {r['error']}")
+                continue
+            # low + (high - low)/2 should equal anchor (= mid) within rounding
+            mid_calc = (r["low"] + r["high"]) / 2
+            if abs(mid_calc - r["anchor"]) > 0.5:
+                FAIL(f"weekly {r['code']}: midpoint {mid_calc} vs anchor {r['anchor']}")
+            # emW = high − anchor (symmetric band)
+            em_calc = r["high"] - r["anchor"]
+            if abs(em_calc - r["emW"]) > 1:
+                FAIL(f"weekly {r['code']}: emW {r['emW']} vs (high − anchor) {em_calc:.0f}")
+            OK(f"weekly {r['code']}: anchor {r['anchor']} ± {r['emW']} → [{r['low']}, {r['high']}]  (exp {r['expiry']})")
+
     # ── regime sanity
     regime = d.get("regime")
     if not isinstance(regime, str) or not regime:

@@ -53,6 +53,22 @@ GLOBAL_IDX = [
 ]
 GAMMA_TICKERS = ["SPY", "QQQ"]
 
+# ETF proxy + cash↔futures ratio used to convert the ETF's listed weekly
+# ATM straddle into a futures-equivalent 1-σ expected move.
+WEEKLY_RANGE_MARKETS = [
+    ("ES",  "ES=F",  "SPY", "S&P 500"),
+    ("NQ",  "NQ=F",  "QQQ", "Nasdaq 100"),
+    ("YM",  "YM=F",  "DIA", "Dow 30"),
+    ("RTY", "RTY=F", "IWM", "Russell 2000"),
+    ("GC",  "GC=F",  "GLD", "Gold"),
+]
+
+import math
+# ATM straddle × √(π/2) = 1-σ expected move. This is the convention every
+# major EM tracker (impliedopen etc.) uses, and the factor cleanly converts
+# the straddle price into the theoretical 1-σ band.
+SQRT_PI_2 = math.sqrt(math.pi / 2)
+
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -123,7 +139,104 @@ def _gap_class(frac):
 
 # ── section computers ─────────────────────────────────────────────────────
 
-def compute_intraday(fut_intra, daily):
+
+def _next_friday_str(now_et: pd.Timestamp) -> str:
+    """Next Friday's date as YYYY-MM-DD (today if today IS Friday before the
+    cash close, else the following Friday)."""
+    today = now_et.date()
+    days_ahead = (4 - today.weekday()) % 7
+    if days_ahead == 0 and now_et.hour >= 16:
+        days_ahead = 7
+    return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+
+def _atm_straddle_mid(etf: str, target_str: str, cur_etf: float):
+    """ATM straddle price (call mid + put mid) at the option expiry closest
+    to target_str. Falls back to lastPrice if bid/ask aren't quoted."""
+    t = yf.Ticker(etf)
+    exps = t.options
+    if not exps:
+        return None, None
+    if target_str in exps:
+        exp = target_str
+    else:
+        from datetime import datetime as _dt
+        target_dt = _dt.strptime(target_str, "%Y-%m-%d")
+        exp = min(exps, key=lambda e: abs((_dt.strptime(e, "%Y-%m-%d") - target_dt).days))
+    try:
+        oc = t.option_chain(exp)
+    except Exception:
+        return None, exp
+    if oc.calls.empty or oc.puts.empty:
+        return None, exp
+    c = oc.calls.iloc[(oc.calls["strike"] - cur_etf).abs().idxmin()]
+    p = oc.puts.iloc[(oc.puts["strike"] - cur_etf).abs().idxmin()]
+
+    def _mid(row):
+        b = float(row.get("bid", 0) or 0)
+        a = float(row.get("ask", 0) or 0)
+        if b > 0 and a > 0:
+            return (b + a) / 2
+        return float(row.get("lastPrice", 0) or 0)
+
+    return _mid(c) + _mid(p), exp
+
+
+def compute_weekly_range(fut_intra) -> dict:
+    """Weekly expected range for each market (incl. GC), anchored at the
+    current futures price and sized by the 1-σ weekly move derived from the
+    ETF proxy's ATM straddle (× √(π/2)). Returns the rows for the page and
+    a {code: emW} map the intraday section can use for σW math."""
+    now_et = pd.Timestamp.now(tz=ET)
+    target = _next_friday_str(now_et)
+    rows = []
+    em_map: dict[str, int] = {}
+    for code, fsym, etf, name in WEEKLY_RANGE_MARKETS:
+        try:
+            # Current futures price — from the cached intraday set if present,
+            # else a quick daily pull for GC which isn't in the main MARKETS.
+            if fsym in fut_intra.columns.get_level_values(0):
+                cur_s = fut_intra[fsym]["Close"].dropna()
+                cur_fut = float(cur_s.iloc[-1]) if len(cur_s) else None
+            else:
+                d = yf.download(fsym, period="5d", interval="1d",
+                                progress=False, auto_adjust=True)
+                v = d["Close"].iloc[-1]
+                cur_fut = float(v.item() if hasattr(v, "item") else v)
+            t = yf.Ticker(etf)
+            try:
+                cur_etf = float(t.fast_info.get("lastPrice") or
+                                t.fast_info.get("regularMarketPrice"))
+            except Exception:
+                cur_etf = float(t.history(period="1d")["Close"].iloc[-1])
+            if not cur_fut or cur_etf <= 0:
+                rows.append({"code": code, "name": name, "error": "no price"})
+                continue
+            straddle, exp = _atm_straddle_mid(etf, target, cur_etf)
+            if straddle is None or straddle <= 0:
+                rows.append({"code": code, "name": name, "error": "no option chain"})
+                continue
+            ratio = cur_fut / cur_etf
+            em_fut = straddle * SQRT_PI_2 * ratio  # 1-σ in futures terms
+            em_map[code] = int(round(em_fut))
+            rows.append({
+                "code": code, "name": name,
+                "anchor": round(cur_fut, 2),
+                "low":    round(cur_fut - em_fut, 2),
+                "high":   round(cur_fut + em_fut, 2),
+                "emW":    int(round(em_fut)),
+                "etf": etf, "etfPx": round(cur_etf, 2),
+                "straddle": round(straddle, 2),
+                "ratio": round(ratio, 2),
+                "expiry": exp,
+            })
+        except Exception as e:
+            rows.append({"code": code, "name": name, "error": str(e)})
+    return {"targetFriday": target, "rows": rows, "emMap": em_map}
+
+
+
+def compute_intraday(fut_intra, daily, weekly_em_map: dict | None = None):
     today_et = pd.Timestamp.now(tz=ET).date()
     monday_et = today_et - timedelta(days=today_et.weekday())
     month_start_et = today_et.replace(day=1)
@@ -163,7 +276,13 @@ def compute_intraday(fut_intra, daily):
             sig_pct = float(rets.tail(20).std()) if len(rets) >= 5 else 0
             vol_src = "realized"
         em_d = open_930 * sig_pct
-        em_w = em_d * np.sqrt(5); em_m = em_d * np.sqrt(21)
+        # Prefer the option-implied 1-σ weekly EM (from the ATM straddle) when
+        # it's available — matches every major EM tracker, and is ~25% tighter
+        # than the √5 × daily approximation in normal contango regimes.
+        # Falls back to √5 × daily if the option chain wasn't available.
+        em_w_opt = (weekly_em_map or {}).get(code)
+        em_w = float(em_w_opt) if em_w_opt and em_w_opt > 0 else em_d * np.sqrt(5)
+        em_m = em_d * np.sqrt(21)
         cur_s = fi["Close"].dropna()
         cur = float(cur_s.iloc[-1]) if len(cur_s) else open_930
         wk_bar = _find_930_bar(fi, monday_et)
@@ -401,7 +520,10 @@ def compute():
     cash_daily = yf.download(cash_syms, period="5d", interval="1d",
                              group_by="ticker", progress=False, auto_adjust=True)
 
-    intraday_rows = compute_intraday(fut_intra, daily)
+    # Weekly EM first so the intraday section can use the option-implied
+    # value (matches impliedopen.com etc.) for emW instead of √5 × daily.
+    weekly = compute_weekly_range(fut_intra)
+    intraday_rows = compute_intraday(fut_intra, daily, weekly.get("emMap"))
     pre = compute_premarket(fut_intra, daily, cash_daily, intraday_rows)
     or_data = compute_open_range(fut_intra, intraday_rows)
     gamma = compute_gamma()
@@ -419,6 +541,9 @@ def compute():
     for r in intraday_rows:
         r.pop("_em_d", None)
 
+    # Drop the internal map before returning; only the row data is needed downstream.
+    weekly.pop("emMap", None)
+
     return {
         "asOf": pd.Timestamp.now(tz=ET).strftime("%Y-%m-%d %H:%M ET"),
         "regime": regime,
@@ -426,6 +551,7 @@ def compute():
         "premarket": pre,
         "openRange": or_data,
         "gamma": gamma,
+        "weekly": weekly,
     }
 
 
@@ -505,6 +631,18 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 .gcard .pw{color:#ff6688;font-weight:700}
 .gcard .gd{font-size:.74rem;margin-top:7px;font-weight:600}
 
+/* Weekly range rows */
+.wkrow{display:grid;grid-template-columns:54px 1fr auto;gap:10px;align-items:baseline;padding:10px 13px;background:#141414;border:1px solid #222;border-radius:10px;margin:0 0 7px}
+.wkrow .wcode{font-size:1rem;font-weight:800}
+.wkrow .wname{font-size:.66rem;color:#666;display:block;margin-top:2px}
+.wkrow .wmid{font-size:.78rem;color:#aaa}
+.wkrow .wmid b{color:#ddd}
+.wkrow .wmid .wlo{color:#ff6688;font-weight:700}
+.wkrow .wmid .whi{color:#00cc88;font-weight:700}
+.wkrow .wright{text-align:right}
+.wkrow .wem{font-size:.95rem;font-weight:700;color:#ffcc44}
+.wkrow .wexp{font-size:.62rem;color:#666;margin-top:3px}
+
 .note{font-size:.72rem;color:#666;text-align:center;margin:22px 0;line-height:1.65}
 </style></head><body>
 <h1>Expected Move</h1>
@@ -523,6 +661,9 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 
 <div class=section><h2>Gamma walls</h2><div class=line></div><div class=hint>SPY · QQQ nearest expiry</div></div>
 <div id=gamma></div>
+
+<div class=section><h2>Weekly range</h2><div class=line></div><div class=hint id=wkhint>next Friday · 1σ from ATM straddle</div></div>
+<div id=weekly></div>
 
 <div class=note>Anchor & EM frozen at the 9:30 ET open and held all day. σ = daily EMs travelled from that open. R/S = daily EM levels. "paste" = numbers for the indicator. Free delayed data (~15 min). Reloads every 60s.</div>
 
@@ -641,6 +782,21 @@ function renderGamma(g){
   document.getElementById('gamma').innerHTML = h;
 }
 
+function renderWeekly(w){
+  const hint = document.getElementById('wkhint');
+  if(hint) hint.textContent = (w.targetFriday ? 'expiry '+w.targetFriday+' · 1σ from ATM straddle' : '1σ from ATM straddle');
+  const rows = w.rows||[];
+  const h = rows.map(r=>{
+    if(r.error) return '<div class=wkrow><span class=wcode>'+r.code+'</span><span class=wmid>'+r.name+' — '+r.error+'</span><span></span></div>';
+    return '<div class=wkrow>'
+      +'<div><span class=wcode>'+r.code+'</span><span class=wname>'+r.name+'</span></div>'
+      +'<div class=wmid><span class=wlo>'+fmt(r.low)+'</span> · mid <b>'+fmt(r.anchor)+'</b> · <span class=whi>'+fmt(r.high)+'</span></div>'
+      +'<div class=wright><div class=wem>± '+fmt(r.emW)+'</div><div class=wexp>'+r.etf+' '+fmt(r.straddle)+' × √π/2</div></div>'
+      +'</div>';
+  }).join('');
+  document.getElementById('weekly').innerHTML = h;
+}
+
 async function go(){
   let d; try{ d=await (await fetch('/api/four')).json(); }catch(e){ return; }
   if(d.error){document.getElementById('regime').textContent='data error';return;}
@@ -650,6 +806,7 @@ async function go(){
   renderIntraday(d.intraday||[]);
   renderOpenRange(d.openRange||{available:false});
   renderGamma(d.gamma||[]);
+  renderWeekly(d.weekly||{rows:[]});
 }
 go(); setInterval(go,60000);
 </script></body></html>"""

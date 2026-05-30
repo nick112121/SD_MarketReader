@@ -63,6 +63,19 @@ WEEKLY_RANGE_MARKETS = [
     ("GC",  "GC=F",  "GLD", "Gold"),
 ]
 
+# Individual tech leaders — stocks are their own underlying, so the weekly
+# 1-σ EM is just (their own ATM straddle) × √(π/2). No ETF proxy needed.
+TECH_STOCKS = [
+    ("MSFT", "Microsoft"),
+    ("AAPL", "Apple"),
+    ("NVDA", "Nvidia"),
+    ("GOOG", "Alphabet"),
+    ("AMZN", "Amazon"),
+    ("META", "Meta"),
+    ("TSLA", "Tesla"),
+    ("AVGO", "Broadcom"),
+]
+
 import math
 # ATM straddle × √(π/2) = 1-σ expected move. This is the convention every
 # major EM tracker (impliedopen etc.) uses, and the factor cleanly converts
@@ -233,6 +246,42 @@ def compute_weekly_range(fut_intra) -> dict:
         except Exception as e:
             rows.append({"code": code, "name": name, "error": str(e)})
     return {"targetFriday": target, "rows": rows, "emMap": em_map}
+
+
+def compute_weekly_stocks() -> dict:
+    """Weekly 1-σ expected range for individual stocks (no ETF proxy — the
+    stock IS the underlying). Same convention: ATM straddle × √(π/2)."""
+    now_et = pd.Timestamp.now(tz=ET)
+    target = _next_friday_str(now_et)
+    rows = []
+    for sym, name in TECH_STOCKS:
+        try:
+            t = yf.Ticker(sym)
+            try:
+                cur = float(t.fast_info.get("lastPrice") or
+                            t.fast_info.get("regularMarketPrice"))
+            except Exception:
+                cur = float(t.history(period="1d")["Close"].iloc[-1])
+            if not cur or cur <= 0:
+                rows.append({"sym": sym, "name": name, "error": "no price"})
+                continue
+            straddle, exp = _atm_straddle_mid(sym, target, cur)
+            if straddle is None or straddle <= 0:
+                rows.append({"sym": sym, "name": name, "error": "no option chain"})
+                continue
+            em = straddle * SQRT_PI_2
+            rows.append({
+                "sym": sym, "name": name,
+                "anchor": round(cur, 2),
+                "low":    round(cur - em, 2),
+                "high":   round(cur + em, 2),
+                "emW":    round(em, 2),
+                "straddle": round(straddle, 2),
+                "expiry": exp,
+            })
+        except Exception as e:
+            rows.append({"sym": sym, "name": name, "error": str(e)})
+    return {"targetFriday": target, "rows": rows}
 
 
 
@@ -527,6 +576,7 @@ def compute():
     pre = compute_premarket(fut_intra, daily, cash_daily, intraday_rows)
     or_data = compute_open_range(fut_intra, intraday_rows)
     gamma = compute_gamma()
+    weekly_stocks = compute_weekly_stocks()
 
     movers = [r for r in intraday_rows if abs(r.get("sigD", 0)) >= 0.5]
     if not movers:
@@ -552,6 +602,7 @@ def compute():
         "openRange": or_data,
         "gamma": gamma,
         "weekly": weekly,
+        "weeklyStocks": weekly_stocks,
     }
 
 
@@ -662,8 +713,11 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 <div class=section><h2>Gamma walls</h2><div class=line></div><div class=hint>SPY · QQQ nearest expiry</div></div>
 <div id=gamma></div>
 
-<div class=section><h2>Weekly range</h2><div class=line></div><div class=hint id=wkhint>next Friday · 1σ from ATM straddle</div></div>
+<div class=section><h2>Weekly range — futures</h2><div class=line></div><div class=hint id=wkhint>next Friday · 1σ from ATM straddle</div></div>
 <div id=weekly></div>
+
+<div class=section><h2>Weekly range — tech</h2><div class=line></div><div class=hint id=wkstkhint>next Friday · 1σ from each stock's own ATM straddle</div></div>
+<div id=weeklyStocks></div>
 
 <div class=note>Anchor & EM frozen at the 9:30 ET open and held all day. σ = daily EMs travelled from that open. R/S = daily EM levels. "paste" = numbers for the indicator. Free delayed data (~15 min). Reloads every 60s.</div>
 
@@ -797,6 +851,21 @@ function renderWeekly(w){
   document.getElementById('weekly').innerHTML = h;
 }
 
+function renderWeeklyStocks(w){
+  const hint = document.getElementById('wkstkhint');
+  if(hint) hint.textContent = (w.targetFriday ? 'expiry '+w.targetFriday+' · 1σ from each stock\'s own ATM straddle' : '1σ from each stock\'s own ATM straddle');
+  const rows = w.rows||[];
+  const h = rows.map(r=>{
+    if(r.error) return '<div class=wkrow><span class=wcode>'+r.sym+'</span><span class=wmid>'+r.name+' — '+r.error+'</span><span></span></div>';
+    return '<div class=wkrow>'
+      +'<div><span class=wcode>'+r.sym+'</span><span class=wname>'+r.name+'</span></div>'
+      +'<div class=wmid><span class=wlo>'+fmt(r.low)+'</span> · mid <b>'+fmt(r.anchor)+'</b> · <span class=whi>'+fmt(r.high)+'</span></div>'
+      +'<div class=wright><div class=wem>± '+r.emW.toFixed(2)+'</div><div class=wexp>straddle '+r.straddle.toFixed(2)+' × √π/2</div></div>'
+      +'</div>';
+  }).join('');
+  document.getElementById('weeklyStocks').innerHTML = h;
+}
+
 async function go(){
   let d; try{ d=await (await fetch('/api/four')).json(); }catch(e){ return; }
   if(d.error){document.getElementById('regime').textContent='data error';return;}
@@ -807,6 +876,7 @@ async function go(){
   renderOpenRange(d.openRange||{available:false});
   renderGamma(d.gamma||[]);
   renderWeekly(d.weekly||{rows:[]});
+  renderWeeklyStocks(d.weeklyStocks||{rows:[]});
 }
 go(); setInterval(go,60000);
 </script></body></html>"""

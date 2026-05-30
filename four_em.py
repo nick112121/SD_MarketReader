@@ -635,7 +635,13 @@ def api_four():
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Expected Move</title><style>
-body{background:#0d0d0d;color:#eee;font-family:system-ui,Segoe UI,sans-serif;margin:0 auto;padding:20px;max-width:640px;font-size:16px}
+body{background:#0d0d0d;color:#eee;font-family:system-ui,Segoe UI,sans-serif;margin:0 auto;padding:20px;max-width:min(96vw,1280px);font-size:16px}
+/* Side-by-side groups — sections inside one of these wrap as columns on
+   wide screens, then collapse to a single column on narrow ones. */
+.group{display:grid;gap:18px;margin:0}
+.group-2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.group-3{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.col{min-width:0}
 h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;margin:0 0 6px;text-align:center}
 .regime{text-align:center;font-size:1.1rem;font-weight:700;margin:0 0 4px;color:#ffcc44}
 .asof{text-align:center;font-size:.72rem;color:#666;margin:0 0 6px;letter-spacing:.05em}
@@ -718,27 +724,45 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 <div class=regime id=regime>...</div>
 <div class=asof id=asof></div>
 
-<div class=section><h2>Pre-market</h2><div class=line></div><div class=hint>US implied opens · global</div></div>
-<div id=pmus></div>
-<div id=pmglobal></div>
+<div class="group group-2">
+  <div class=col>
+    <div class=section><h2>Pre-market · US</h2><div class=line></div><div class=hint>implied opens</div></div>
+    <div id=pmus></div>
+  </div>
+  <div class=col>
+    <div class=section><h2>Pre-market · Global</h2><div class=line></div><div class=hint>FTSE · DAX · Nikkei · HSI</div></div>
+    <div id=pmglobal></div>
+  </div>
+</div>
 
 <div class=section><h2>Intraday EM</h2><div class=line></div><div class=hint>9:30-anchored · frozen</div></div>
 <div id=intraday></div>
 
-<div class=section><h2>Open range</h2><div class=line></div><div class=hint>9:30-10:00 vs daily EM</div></div>
-<div id=openrange></div>
+<div class="group group-2">
+  <div class=col>
+    <div class=section><h2>Open range</h2><div class=line></div><div class=hint>9:30-10:00 vs daily EM</div></div>
+    <div id=openrange></div>
+  </div>
+  <div class=col>
+    <div class=section><h2>Gamma walls</h2><div class=line></div><div class=hint>SPY · QQQ nearest expiry</div></div>
+    <div id=gamma></div>
+  </div>
+</div>
 
-<div class=section><h2>Gamma walls</h2><div class=line></div><div class=hint>SPY · QQQ nearest expiry</div></div>
-<div id=gamma></div>
-
-<div class=section><h2>Weekly range — futures</h2><div class=line></div><div class=hint id=wkhint>next Friday · 1σ from ATM straddle</div></div>
-<div id=weekly></div>
-
-<div class=section><h2>Weekly range — tech</h2><div class=line></div><div class=hint id=wkstkhint>next Friday · 1σ from each stock's own ATM straddle</div></div>
-<div id=weeklyStocks></div>
-
-<div class=section><h2>Weekly range — sectors</h2><div class=line></div><div class=hint id=wksechint>next Friday · 1σ from each ETF's own ATM straddle</div></div>
-<div id=weeklySectors></div>
+<div class="group group-3">
+  <div class=col>
+    <div class=section><h2>Weekly · futures</h2><div class=line></div><div class=hint id=wkhint>next Friday · 1σ from ATM straddle</div></div>
+    <div id=weekly></div>
+  </div>
+  <div class=col>
+    <div class=section><h2>Weekly · tech</h2><div class=line></div><div class=hint id=wkstkhint>next Friday · 1σ from each stock's own ATM straddle</div></div>
+    <div id=weeklyStocks></div>
+  </div>
+  <div class=col>
+    <div class=section><h2>Weekly · sectors</h2><div class=line></div><div class=hint id=wksechint>next Friday · 1σ from each ETF's own ATM straddle</div></div>
+    <div id=weeklySectors></div>
+  </div>
+</div>
 
 <div class=note>Anchor & EM frozen at the 9:30 ET open and held all day. σ = daily EMs travelled from that open. R/S = daily EM levels. "paste" = numbers for the indicator. Free delayed data (~15 min). Reloads every 60s.</div>
 

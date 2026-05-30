@@ -300,6 +300,83 @@ def compute_weekly_sectors() -> dict:
     return _compute_weekly_underlyings(SECTOR_ETFS)
 
 
+def compute_daily_em_nq(fut_intra) -> dict:
+    """Per-day cumulative 1-σ band for NQ for each Mon-Fri of the upcoming
+    week, using the QQQ daily-expiry ATM straddle × √(π/2) × (NQ/QQQ ratio).
+    Matches RDGD's "Daily Levels For Futures – NQ!" weekend format. The mid
+    is the current NQ price (Friday close on weekends) — same anchor for
+    every day. Each day's EM grows because each day's expiry has more time
+    value baked in. Skips holidays (no expiry on that date)."""
+    now_et = pd.Timestamp.now(tz=ET)
+    today = now_et.date()
+    # Next Monday (today if today IS Monday during the day)
+    days_to_mon = (7 - today.weekday()) % 7
+    if today.weekday() == 0 and now_et.hour < 16:
+        days_to_mon = 0
+    monday = today + timedelta(days=days_to_mon)
+
+    rows: list[dict] = []
+    try:
+        if "NQ=F" in fut_intra.columns.get_level_values(0):
+            s = fut_intra["NQ=F"]["Close"].dropna()
+            cur_nq = float(s.iloc[-1]) if len(s) else None
+        else:
+            d = yf.download("NQ=F", period="5d", interval="1d", progress=False, auto_adjust=True)
+            v = d["Close"].iloc[-1]
+            cur_nq = float(v.item() if hasattr(v, "item") else v)
+        t = yf.Ticker("QQQ")
+        try:
+            cur_qqq = float(t.fast_info.get("lastPrice") or
+                            t.fast_info.get("regularMarketPrice"))
+        except Exception:
+            cur_qqq = float(t.history(period="1d")["Close"].iloc[-1])
+        if not cur_nq or not cur_qqq or cur_qqq <= 0:
+            return {"market": "NQ", "ratio": None, "anchor": None, "rows": [{"error": "no price"}]}
+        ratio = cur_nq / cur_qqq
+        exps_avail = set(t.options or [])
+    except Exception as e:
+        return {"market": "NQ", "ratio": None, "anchor": None, "rows": [{"error": str(e)}]}
+
+    for i in range(5):
+        d = monday + timedelta(days=i)
+        day_name = d.strftime("%a")
+        dstr = d.strftime("%Y-%m-%d")
+        if dstr not in exps_avail:
+            rows.append({"day": day_name, "date": dstr, "error": "no expiry (holiday?)"})
+            continue
+        try:
+            oc = t.option_chain(dstr)
+            if oc.calls.empty or oc.puts.empty:
+                rows.append({"day": day_name, "date": dstr, "error": "empty chain"})
+                continue
+            c = oc.calls.iloc[(oc.calls["strike"] - cur_qqq).abs().idxmin()]
+            p = oc.puts.iloc[(oc.puts["strike"] - cur_qqq).abs().idxmin()]
+
+            def _mid(r):
+                b = float(r.get("bid", 0) or 0)
+                a = float(r.get("ask", 0) or 0)
+                return (b + a) / 2 if (b > 0 and a > 0) else float(r.get("lastPrice", 0) or 0)
+
+            straddle = _mid(c) + _mid(p)
+            if straddle <= 0:
+                rows.append({"day": day_name, "date": dstr, "error": "no straddle quote"})
+                continue
+            em = straddle * SQRT_PI_2 * ratio
+            rows.append({
+                "day":   day_name,
+                "date":  dstr,
+                "anchor": round(cur_nq, 2),
+                "low":   round(cur_nq - em, 2),
+                "high":  round(cur_nq + em, 2),
+                "em":    int(round(em)),
+                "straddle": round(straddle, 2),
+            })
+        except Exception as e:
+            rows.append({"day": day_name, "date": dstr, "error": str(e)})
+    return {"market": "NQ", "ratio": round(ratio, 2), "anchor": round(cur_nq, 2),
+            "rows": rows}
+
+
 
 def compute_intraday(fut_intra, daily, weekly_em_map: dict | None = None):
     today_et = pd.Timestamp.now(tz=ET).date()
@@ -594,6 +671,7 @@ def compute():
     gamma = compute_gamma()
     weekly_stocks = compute_weekly_stocks()
     weekly_sectors = compute_weekly_sectors()
+    daily_nq = compute_daily_em_nq(fut_intra)
 
     movers = [r for r in intraday_rows if abs(r.get("sigD", 0)) >= 0.5]
     if not movers:
@@ -621,6 +699,7 @@ def compute():
         "weekly": weekly,
         "weeklyStocks": weekly_stocks,
         "weeklySectors": weekly_sectors,
+        "dailyNq": daily_nq,
     }
 
 
@@ -737,6 +816,9 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 
 <div class=section><h2>Intraday EM</h2><div class=line></div><div class=hint>9:30-anchored · frozen</div></div>
 <div id=intraday></div>
+
+<div class=section><h2>Daily EM · NQ (next week)</h2><div class=line></div><div class=hint id=dnqhint>Mon-Fri · 1σ from QQQ daily-expiry straddle</div></div>
+<div id=dailyNq></div>
 
 <div class="group group-2">
   <div class=col>
@@ -912,6 +994,21 @@ function renderWeeklyUnderlying(w, containerId, hintId, kindLabel){
 }
 function renderWeeklyStocks(w){ renderWeeklyUnderlying(w, 'weeklyStocks', 'wkstkhint', 'stock'); }
 
+function renderDailyNq(dn){
+  const hint = document.getElementById('dnqhint');
+  if(hint) hint.textContent = 'NQ anchor '+fmt(dn.anchor)+'  ·  QQQ ratio '+fmt(dn.ratio)+'  ·  Mon-Fri cumulative 1σ';
+  const rows = dn.rows||[];
+  const h = rows.map(r=>{
+    if(r.error) return '<div class=wkrow><span class=wcode>'+(r.day||'?')+'</span><span class=wmid>'+(r.date||'')+' — '+r.error+'</span><span></span></div>';
+    return '<div class=wkrow>'
+      +'<div><span class=wcode>'+r.day+'</span><span class=wname>'+r.date+'</span></div>'
+      +'<div class=wmid><span class=wlo>'+fmt(r.low)+'</span> · mid <b>'+fmt(r.anchor)+'</b> · <span class=whi>'+fmt(r.high)+'</span></div>'
+      +'<div class=wright><div class=wem>± '+fmt(r.em)+'</div><div class=wexp>straddle '+r.straddle+' × √π/2</div></div>'
+      +'</div>';
+  }).join('');
+  document.getElementById('dailyNq').innerHTML = h;
+}
+
 async function go(){
   let d; try{ d=await (await fetch('/api/four')).json(); }catch(e){ return; }
   if(d.error){document.getElementById('regime').textContent='data error';return;}
@@ -924,6 +1021,7 @@ async function go(){
   renderWeekly(d.weekly||{rows:[]});
   renderWeeklyStocks(d.weeklyStocks||{rows:[]});
   renderWeeklyUnderlying(d.weeklySectors||{rows:[]}, 'weeklySectors', 'wksechint', 'ETF');
+  renderDailyNq(d.dailyNq||{rows:[]});
 }
 go(); setInterval(go,60000);
 </script></body></html>"""

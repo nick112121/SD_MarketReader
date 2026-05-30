@@ -1,0 +1,109 @@
+name: EM dashboard audit
+
+# Twice-daily silent health check for the EM dashboard. Designed to need
+# zero human attention:
+#   1. Run the audit (free, on GitHub).
+#   2. If it fails, retry once after a short delay — filters out transient
+#      yfinance/network hiccups so Claude isn't pinged for noise.
+#   3. Only if the retry ALSO fails, file (or update) a single tracking
+#      issue tagged so Claude picks it up and pushes a minimal fix.
+#
+# Schedule:
+#   * Morning   ~9:40 ET (after the 9:30 RTH anchor latches)
+#   * Post-close ~4:30 ET (after the cash session closes)
+on:
+  schedule:
+    - cron: '40 13 * * 1-5'  # 09:40 ET in EDT / 08:40 ET in EST
+    - cron: '30 20 * * 1-5'  # 16:30 ET in EDT / 15:30 ET in EST
+  workflow_dispatch: {}
+
+concurrency:
+  group: em-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Audit (attempt 1)
+        id: a1
+        continue-on-error: true
+        run: python audit_em.py 2>&1 | tee /tmp/audit.log
+
+      - name: Audit retry (filters transient feed glitches)
+        id: a2
+        if: steps.a1.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "First attempt failed — waiting 60s and retrying..."
+          sleep 60
+          python audit_em.py 2>&1 | tee /tmp/audit.log
+
+      - name: File (or update) auto-fix issue on confirmed failure
+        if: steps.a1.outcome == 'failure' && steps.a2.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const log = fs.readFileSync('/tmp/audit.log', 'utf8').slice(-3500);
+            const title = 'EM dashboard audit failing';
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The scheduled EM dashboard audit failed twice (retry included), so this is real, not a transient feed hiccup.`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `**Audit log (tail):**`,
+              '```',
+              log,
+              '```',
+              ``,
+              `@claude please investigate. Read \`four_em.py\` and \`audit_em.py\`, identify the failing check, push a minimal fix to this branch (do not open a PR), and close this issue once the next audit run passes. If the root cause is external (Yahoo down, ticker delisted, etc.) and not fixable in code, leave a one-line comment and stop — don't keep retrying.`,
+            ].join('\n');
+
+            // Reuse a single tracking issue so recurring failures don't pile up.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'auto-audit',
+              per_page: 50,
+            });
+            const open = existing.data.find(i => i.title === title);
+            if (open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open.number,
+                body,
+              });
+              core.info(`Updated existing issue #${open.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['auto-audit'],
+              });
+              core.info(`Opened issue #${created.data.number}`);
+            }
+
+      - name: Mark workflow failed
+        if: steps.a1.outcome == 'failure' && steps.a2.outcome == 'failure'
+        run: exit 1

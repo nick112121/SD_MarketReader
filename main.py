@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -16,7 +17,25 @@ from fastapi.staticfiles import StaticFiles
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Markov Dashboard")
+# Cap concurrent yfinance calls so Yahoo doesn't throttle us during a refresh.
+# Initialised in lifespan() so the Semaphore binds to the running event loop.
+_yf_sem: asyncio.Semaphore | None = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _yf_sem
+    _yf_sem = asyncio.Semaphore(8)
+    # Pre-warm every timeframe in the background so the first user request
+    # to any tab returns instantly instead of cold-loading 43 tickers
+    # serially. _warmup walks TFs sequentially; the semaphore parallelises
+    # the tickers inside each TF.
+    asyncio.create_task(_warmup())
+    asyncio.create_task(_bg_loop())
+    yield
+
+
+app = FastAPI(title="Markov Dashboard", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 ASSETS: list[dict] = [
@@ -221,23 +240,31 @@ def _analyse(ticker: str, tf: str) -> dict:
 
 
 async def _refresh_tf(tf: str):
+    """Refresh one timeframe's cache. Fans out across the 43 assets in
+    parallel, capped by the module-level semaphore so Yahoo isn't hammered."""
     log.info(f"Refreshing [{tf}]...")
-    for a in ASSETS:
-        try:
-            # Offload the blocking yfinance/pandas work to a thread so the
-            # event loop keeps serving requests during the refresh.
-            _cache[tf][a["ticker"]] = await asyncio.to_thread(_analyse, a["ticker"], tf)
-            log.info(f"  [{tf}] {a['label']} → {_cache[tf][a['ticker']]['signal']}")
-        except Exception as exc:
-            log.warning(f"  [{tf}] {a['label']} failed: {exc}")
-            _cache[tf][a["ticker"]] = {"error": str(exc)}
+
+    async def _one(a):
+        async with _yf_sem:
+            try:
+                data = await asyncio.to_thread(_analyse, a["ticker"], tf)
+                log.info(f"  [{tf}] {a['label']} → {data.get('signal', '?')}")
+                return a["ticker"], data
+            except Exception as exc:
+                log.warning(f"  [{tf}] {a['label']} failed: {exc}")
+                return a["ticker"], {"error": str(exc)}
+
+    results = await asyncio.gather(*[_one(a) for a in ASSETS])
+    for ticker, data in results:
+        _cache[tf][ticker] = data
     _cache_time[tf] = datetime.now(timezone.utc)
 
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(_refresh_tf("1h"))
-    asyncio.create_task(_bg_loop())
+async def _warmup():
+    # Walk TFs sequentially so we don't fan out 5 × 43 = 215 yfinance calls
+    # at once. Inside each TF the semaphore parallelises the tickers.
+    for tf in TF_CONFIG:
+        await _refresh_tf(tf)
 
 
 async def _bg_loop():

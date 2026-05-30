@@ -8,3 +8,18 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.0"
+  # All-in-one expected-move page — ES/NQ/YM/RTY ranked by how far each has
+  # travelled vs its own daily EM (who's leading), with each market's daily
+  # S/R levels and the paste-able daily/weekly/monthly EM numbers. The start
+  # command stays `em_web:app` (unchanged from the deployed service) — em_web
+  # now re-exports four_em, so it deploys on a normal push with no Blueprint
+  # sync. URL is unchanged.
+  - type: web
+    name: nq-expected-move
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn em_web:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"

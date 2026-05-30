@@ -703,11 +703,32 @@ def compute():
     }
 
 
+import time
+
+# Server-side TTL cache for compute() — yfinance pulls take ~10–15s per
+# call, and the page auto-refreshes every 60s; sharing one result across
+# all viewers and across rapid reloads inside this window means refreshes
+# feel instant. If a refresh AFTER the TTL fails (Yahoo blip), serve the
+# stale value rather than 503 so the page stays alive.
+_cache: dict = {"data": None, "ts": 0.0}
+_CACHE_TTL_SECONDS = 45
+
+
 @app.get("/api/four")
 def api_four():
+    now = time.time()
+    if _cache["data"] is not None and (now - _cache["ts"]) < _CACHE_TTL_SECONDS:
+        return JSONResponse(_cache["data"])
     try:
-        return JSONResponse(compute())
+        data = compute()
+        _cache["data"] = data
+        _cache["ts"] = now
+        return JSONResponse(data)
     except Exception as e:
+        if _cache["data"] is not None:
+            stale = dict(_cache["data"])
+            stale["staleNote"] = f"refresh failed; showing prior cached snapshot — {e}"
+            return JSONResponse(stale)
         return JSONResponse({"error": str(e)}, status_code=503)
 
 
@@ -800,7 +821,7 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 .note{font-size:.72rem;color:#666;text-align:center;margin:22px 0;line-height:1.65}
 </style></head><body>
 <h1>Expected Move</h1>
-<div class=regime id=regime>...</div>
+<div class=regime id=regime>loading market data… first request can take 30–60s on a cold server</div>
 <div class=asof id=asof></div>
 
 <div class="group group-2">

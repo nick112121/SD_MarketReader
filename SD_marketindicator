@@ -49,6 +49,8 @@ const EM_DAILY   = 0;    // fallback daily move  (0 = use Settings)
 const EM_WEEKLY  = 0;    // fallback weekly move (0 = use Settings / off)
 const EM_MONTHLY = 0;    // fallback monthly move(0 = use Settings / off)
 const RTH_OPEN   = 0;    // fallback 9:30 open   (0 = use Settings / auto)
+const WEEKLY_ANCHOR  = 0; // fallback weekly anchor — paste dashboard's weekly mid here, 0 = auto (week open)
+const MONTHLY_ANCHOR = 0; // fallback monthly anchor — paste dashboard's monthly mid here, 0 = auto (month open)
 const EM_ZONE_PTS = 0;   // fallback zone half-height in pts (0 = thin lines)
 const MAX_HOLD   = 80;   // max bars in a trade
 const PAUSE_BARS = 50;   // bars to pause after 3/5 losses
@@ -1086,10 +1088,22 @@ class MarketReader {
             if(!(_emW>0)) _emW=EM_WEEKLY;
             let _emM=(p.expMoveMonthly!=null?Number(p.expMoveMonthly):0)||0;
             if(!(_emM>0)) _emM=EM_MONTHLY;
-            this.wk1H=(this.weekOpen>0&&_emW>0)?this.weekOpen+_emW:0;
-            this.wk1L=(this.weekOpen>0&&_emW>0)?this.weekOpen-_emW:0;
-            this.mo1H=(this.monthOpen>0&&_emM>0)?this.monthOpen+_emM:0;
-            this.mo1L=(this.monthOpen>0&&_emM>0)?this.monthOpen-_emM:0;
+            // Anchor precedence: pasted Settings override → code constant
+            // fallback → auto-detected open. Pasting the dashboard's weekly
+            // and monthly `mid` values into Settings makes the indicator's
+            // bands sit on the exact same prices the dashboard displays.
+            const _wkSet = (p.weeklyAnchor!=null?Number(p.weeklyAnchor):0)||0;
+            const _moSet = (p.monthlyAnchor!=null?Number(p.monthlyAnchor):0)||0;
+            const _wkAnchor = _wkSet>0 ? _wkSet
+                            : WEEKLY_ANCHOR>0 ? WEEKLY_ANCHOR
+                            : this.weekOpen;
+            const _moAnchor = _moSet>0 ? _moSet
+                            : MONTHLY_ANCHOR>0 ? MONTHLY_ANCHOR
+                            : this.monthOpen;
+            this.wk1H=(_wkAnchor>0&&_emW>0)?_wkAnchor+_emW:0;
+            this.wk1L=(_wkAnchor>0&&_emW>0)?_wkAnchor-_emW:0;
+            this.mo1H=(_moAnchor>0&&_emM>0)?_moAnchor+_emM:0;
+            this.mo1L=(_moAnchor>0&&_emM>0)?_moAnchor-_emM:0;
 
             // ── DAILY CANDLE — futures-session boundary at 5 PM EDT ──
             let fLth = lth;
@@ -7229,6 +7243,12 @@ module.exports = {
         // here. 0 = auto-detect (only approximate on tick charts, so paste
         // the real open). Step 0.25 = NQ tick, so prices like 29902.25 work.
         rthOpen:        predef.paramSpecs.number(0, 0.25, 0),
+        // weeklyAnchor / monthlyAnchor: paste the dashboard's weekly/monthly
+        // `mid` value here so the indicator's weekly/monthly bands sit on
+        // the exact same prices the dashboard publishes. 0 = use the
+        // auto-detected week-open / month-open as before.
+        weeklyAnchor:   predef.paramSpecs.number(0, 0.25, 0),
+        monthlyAnchor:  predef.paramSpecs.number(0, 0.25, 0),
         // emZonePts: draw each EM level as a ZONE this many points thick on
         // each side of the level (a shaded band with edge + center lines),
         // instead of a thin line. 0 = thin lines. Try 8-20 for NQ.

@@ -163,6 +163,23 @@ def run_audit() -> tuple[int, list[str], list[str], list[str]]:
                 FAIL(f"weeklyStocks {r['sym']}: emW {r['emW']} vs (high − anchor) {em_calc:.2f}")
             OK(f"weeklyStocks {r['sym']}: anchor {r['anchor']} ± {r['emW']} → [{r['low']}, {r['high']}]  (exp {r['expiry']})")
 
+    # ── weekly sector range
+    wsec = d.get("weeklySectors", {})
+    if not isinstance(wsec, dict) or "rows" not in wsec:
+        FAIL("weeklySectors: missing rows")
+    else:
+        for r in wsec.get("rows", []):
+            if "error" in r:
+                WARN(f"weeklySectors {r.get('sym')}: {r['error']}")
+                continue
+            mid_calc = (r["low"] + r["high"]) / 2
+            if abs(mid_calc - r["anchor"]) > 0.05:
+                FAIL(f"weeklySectors {r['sym']}: midpoint {mid_calc} vs anchor {r['anchor']}")
+            em_calc = r["high"] - r["anchor"]
+            if abs(em_calc - r["emW"]) > 0.05:
+                FAIL(f"weeklySectors {r['sym']}: emW {r['emW']} vs (high − anchor) {em_calc:.2f}")
+            OK(f"weeklySectors {r['sym']}: anchor {r['anchor']} ± {r['emW']} → [{r['low']}, {r['high']}]  (exp {r['expiry']})")
+
     # ── regime sanity
     regime = d.get("regime")
     if not isinstance(regime, str) or not regime:

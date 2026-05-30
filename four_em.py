@@ -75,6 +75,13 @@ TECH_STOCKS = [
     ("TSLA", "Tesla"),
     ("AVGO", "Broadcom"),
 ]
+SECTOR_ETFS = [
+    ("XLF", "Financials"),
+    ("XLE", "Energy"),
+    ("XLV", "Healthcare"),
+    ("XLK", "Technology"),
+    ("SMH", "Semiconductors"),
+]
 
 import math
 # ATM straddle × √(π/2) = 1-σ expected move. This is the convention every
@@ -248,13 +255,14 @@ def compute_weekly_range(fut_intra) -> dict:
     return {"targetFriday": target, "rows": rows, "emMap": em_map}
 
 
-def compute_weekly_stocks() -> dict:
-    """Weekly 1-σ expected range for individual stocks (no ETF proxy — the
-    stock IS the underlying). Same convention: ATM straddle × √(π/2)."""
+def _compute_weekly_underlyings(items: list[tuple[str, str]]) -> dict:
+    """Weekly 1-σ expected range for any list of (symbol, friendly name)
+    pairs whose own option chain gives the straddle. Shared by stocks and
+    sector ETFs — for stocks the underlying IS the ticker, no proxy."""
     now_et = pd.Timestamp.now(tz=ET)
     target = _next_friday_str(now_et)
     rows = []
-    for sym, name in TECH_STOCKS:
+    for sym, name in items:
         try:
             t = yf.Ticker(sym)
             try:
@@ -282,6 +290,14 @@ def compute_weekly_stocks() -> dict:
         except Exception as e:
             rows.append({"sym": sym, "name": name, "error": str(e)})
     return {"targetFriday": target, "rows": rows}
+
+
+def compute_weekly_stocks() -> dict:
+    return _compute_weekly_underlyings(TECH_STOCKS)
+
+
+def compute_weekly_sectors() -> dict:
+    return _compute_weekly_underlyings(SECTOR_ETFS)
 
 
 
@@ -577,6 +593,7 @@ def compute():
     or_data = compute_open_range(fut_intra, intraday_rows)
     gamma = compute_gamma()
     weekly_stocks = compute_weekly_stocks()
+    weekly_sectors = compute_weekly_sectors()
 
     movers = [r for r in intraday_rows if abs(r.get("sigD", 0)) >= 0.5]
     if not movers:
@@ -603,6 +620,7 @@ def compute():
         "gamma": gamma,
         "weekly": weekly,
         "weeklyStocks": weekly_stocks,
+        "weeklySectors": weekly_sectors,
     }
 
 
@@ -718,6 +736,9 @@ h1{font-size:1rem;letter-spacing:.2em;color:#00ff88;text-transform:uppercase;mar
 
 <div class=section><h2>Weekly range — tech</h2><div class=line></div><div class=hint id=wkstkhint>next Friday · 1σ from each stock's own ATM straddle</div></div>
 <div id=weeklyStocks></div>
+
+<div class=section><h2>Weekly range — sectors</h2><div class=line></div><div class=hint id=wksechint>next Friday · 1σ from each ETF's own ATM straddle</div></div>
+<div id=weeklySectors></div>
 
 <div class=note>Anchor & EM frozen at the 9:30 ET open and held all day. σ = daily EMs travelled from that open. R/S = daily EM levels. "paste" = numbers for the indicator. Free delayed data (~15 min). Reloads every 60s.</div>
 
@@ -851,9 +872,9 @@ function renderWeekly(w){
   document.getElementById('weekly').innerHTML = h;
 }
 
-function renderWeeklyStocks(w){
-  const hint = document.getElementById('wkstkhint');
-  if(hint) hint.textContent = (w.targetFriday ? 'expiry '+w.targetFriday+' · 1σ from each stock\'s own ATM straddle' : '1σ from each stock\'s own ATM straddle');
+function renderWeeklyUnderlying(w, containerId, hintId, kindLabel){
+  const hint = document.getElementById(hintId);
+  if(hint) hint.textContent = (w.targetFriday ? 'expiry '+w.targetFriday+' · 1σ from each '+kindLabel+'\'s own ATM straddle' : '1σ from each '+kindLabel+'\'s own ATM straddle');
   const rows = w.rows||[];
   const h = rows.map(r=>{
     if(r.error) return '<div class=wkrow><span class=wcode>'+r.sym+'</span><span class=wmid>'+r.name+' — '+r.error+'</span><span></span></div>';
@@ -863,8 +884,9 @@ function renderWeeklyStocks(w){
       +'<div class=wright><div class=wem>± '+r.emW.toFixed(2)+'</div><div class=wexp>straddle '+r.straddle.toFixed(2)+' × √π/2</div></div>'
       +'</div>';
   }).join('');
-  document.getElementById('weeklyStocks').innerHTML = h;
+  document.getElementById(containerId).innerHTML = h;
 }
+function renderWeeklyStocks(w){ renderWeeklyUnderlying(w, 'weeklyStocks', 'wkstkhint', 'stock'); }
 
 async function go(){
   let d; try{ d=await (await fetch('/api/four')).json(); }catch(e){ return; }
@@ -877,6 +899,7 @@ async function go(){
   renderGamma(d.gamma||[]);
   renderWeekly(d.weekly||{rows:[]});
   renderWeeklyStocks(d.weeklyStocks||{rows:[]});
+  renderWeeklyUnderlying(d.weeklySectors||{rows:[]}, 'weeklySectors', 'wksechint', 'ETF');
 }
 go(); setInterval(go,60000);
 </script></body></html>"""

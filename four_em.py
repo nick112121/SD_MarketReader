@@ -173,11 +173,18 @@ def compute_intraday(fut_intra, daily):
         move = cur - open_930; wk_move = cur - wk_open
         sd = move / em_d if em_d > 0 else 0
         sw = wk_move / em_w if em_w > 0 else 0
+        # Round the EM once and use that value for both display AND the R/S
+        # levels — otherwise the dashboard's levels (computed off the un-
+        # rounded float) don't match what the indicator draws when you
+        # paste the rounded integer in. Off by a fraction otherwise.
+        emD_int = int(round(em_d))
+        emW_int = int(round(em_w))
+        emM_int = int(round(em_m))
         rows.append({
             "code": code, "name": name,
             "price": round(cur, 2), "open": round(open_930, 2),
             "weekOpen": round(wk_open, 2), "monthOpen": round(mo_open, 2),
-            "emD": int(round(em_d)), "emW": int(round(em_w)), "emM": int(round(em_m)),
+            "emD": emD_int, "emW": emW_int, "emM": emM_int,
             "sigD": round(sd, 2), "sigW": round(sw, 2),
             "pctD": int(round(abs(sd) * 100)),
             "dir": 1 if move >= 0 else -1,
@@ -185,10 +192,10 @@ def compute_intraday(fut_intra, daily):
             "anchorDate": str(anchor_date), "stale": stale,
             "status": _status(sd, sw),
             "lvls": {
-                "r2": round(open_930 + em_d, 2),
-                "r1": round(open_930 + em_d * 0.5, 2),
-                "s1": round(open_930 - em_d * 0.5, 2),
-                "s2": round(open_930 - em_d, 2),
+                "r2": round(open_930 + emD_int, 2),
+                "r1": round(open_930 + emD_int * 0.5, 2),
+                "s1": round(open_930 - emD_int * 0.5, 2),
+                "s2": round(open_930 - emD_int, 2),
             },
             "_em_d": em_d,
         })
@@ -198,30 +205,48 @@ def compute_intraday(fut_intra, daily):
 def compute_premarket(fut_intra, daily, cash_daily, intraday_rows):
     today_et = pd.Timestamp.now(tz=ET).date()
     em_map = {r["code"]: r for r in intraday_rows if "_em_d" in r}
+    intra_map = {r["code"]: r for r in intraday_rows if "code" in r}
     us_rows = []
     for code, fsym, _vsym, csym, name in MARKETS:
         try:
             cd = cash_daily[csym].dropna(subset=["Close"])
-            cash_close = float(cd["Close"].iloc[-1])
+            # Cash close = the most recent close BEFORE today (yesterday's
+            # cash close, not today's forming bar).
+            cash_prev = cd[cd.index.date < today_et]
+            cash_close = float(cash_prev["Close"].iloc[-1]) if not cash_prev.empty else float(cd["Close"].iloc[-1])
+
+            # If today's 9:30 RTH has fired and the anchor isn't stale, show
+            # the REALIZED open + actual overnight gap. Otherwise estimate an
+            # implied open from current futures vs yesterday's futures close.
+            intra = intra_map.get(code, {})
+            is_realized = bool(intra and not intra.get("stale", True) and intra.get("anchorDate") == str(today_et))
+
             fd_d = daily[fsym].dropna(subset=["Close"])
             fi = fut_intra[fsym]
             cur_fut = float(fi["Close"].dropna().iloc[-1])
             prev_fut_bars = fd_d[fd_d.index.date < today_et]
             prev_fut = float(prev_fut_bars["Close"].iloc[-1]) if not prev_fut_bars.empty else cur_fut
-            overnight = cur_fut - prev_fut
-            implied_open = cash_close + overnight
+
+            if is_realized:
+                shown_open = float(intra["open"])
+                gap = shown_open - cash_close
+            else:
+                gap = cur_fut - prev_fut
+                shown_open = cash_close + gap
+
             em_today = em_map.get(code, {}).get("_em_d", 0)
-            frac = overnight / em_today if em_today > 0 else 0
+            frac = gap / em_today if em_today > 0 else 0
             gap_cls, gap_color = _gap_class(frac)
             us_rows.append({
                 "code": code, "name": name,
                 "cashClose": round(cash_close, 2),
-                "impliedOpen": round(implied_open, 2),
-                "overnight": round(overnight, 2),
+                "impliedOpen": round(shown_open, 2),
+                "overnight": round(gap, 2),
                 "futNow": round(cur_fut, 2), "futPrev": round(prev_fut, 2),
                 "gapEmFrac": round(frac, 2),
                 "gapClass": gap_cls, "gapColor": gap_color,
-                "dir": 1 if overnight >= 0 else -1,
+                "dir": 1 if gap >= 0 else -1,
+                "isRealized": is_realized,
             })
         except Exception as e:
             us_rows.append({"code": code, "name": name, "error": str(e)})
@@ -297,23 +322,18 @@ def compute_gamma():
             except Exception:
                 cur = float(t.history(period="1d")["Close"].iloc[-1])
             calls = oc.calls.dropna(subset=["openInterest"])
-            puts = oc.puts.dropna(subset=["openInterest"])
-            # Call wall: highest OI strike at or above spot — within ~10%
-            calls_near = calls[(calls["strike"] >= cur * 0.97) & (calls["strike"] <= cur * 1.10)]
-            if not calls_near.empty:
-                cw_row = calls_near.loc[calls_near["openInterest"].idxmax()]
-            elif not calls.empty:
-                cw_row = calls.loc[calls["openInterest"].idxmax()]
-            else:
-                cw_row = None
-            # Put wall: highest OI strike at or below spot — within ~10%
-            puts_near = puts[(puts["strike"] >= cur * 0.90) & (puts["strike"] <= cur * 1.03)]
-            if not puts_near.empty:
-                pw_row = puts_near.loc[puts_near["openInterest"].idxmax()]
-            elif not puts.empty:
-                pw_row = puts.loc[puts["openInterest"].idxmax()]
-            else:
-                pw_row = None
+            puts  = oc.puts.dropna(subset=["openInterest"])
+            # Call wall: highest call-OI strike STRICTLY at/above spot, within
+            # ~10% — the resistance dealers defend. Put wall: highest put-OI
+            # strike STRICTLY at/below spot, within ~10% — the support.
+            # Without these strict sides, a deep-OI ITM strike could land on
+            # the wrong side (e.g. SPY call-wall printing below spot).
+            calls_above = calls[(calls["strike"] >= cur) & (calls["strike"] <= cur * 1.10)]
+            cw_row = (calls_above.loc[calls_above["openInterest"].idxmax()]
+                      if not calls_above.empty else None)
+            puts_below = puts[(puts["strike"] <= cur) & (puts["strike"] >= cur * 0.90)]
+            pw_row = (puts_below.loc[puts_below["openInterest"].idxmax()]
+                      if not puts_below.empty else None)
             call_wall = float(cw_row["strike"]) if cw_row is not None else None
             call_oi   = int(cw_row["openInterest"]) if cw_row is not None else 0
             put_wall  = float(pw_row["strike"]) if pw_row is not None else None
@@ -518,9 +538,10 @@ function renderPremarket(p){
   const usRows = (p.us||[]).map(r=>{
     if(r.error) return '<div class=pmrow><span class=pcode>'+r.code+'</span><span class=pmid>'+r.name+' — '+r.error+'</span><span></span></div>';
     const arrow=r.dir>0?'▲':'▼', col=r.dir>0?'#00ff88':'#ff4466';
+    const openLabel = r.isRealized ? 'actual open' : 'implied open';
     return '<div class=pmrow>'
       +'<div><span class=pcode>'+r.code+'</span><span class=pname>'+r.name+'</span></div>'
-      +'<div class=pmid>close <b>'+fmt(r.cashClose)+'</b> → implied open <b>'+fmt(r.impliedOpen)+'</b></div>'
+      +'<div class=pmid>close <b>'+fmt(r.cashClose)+'</b> → '+openLabel+' <b>'+fmt(r.impliedOpen)+'</b></div>'
       +'<div class=pright><div class=pmove style="color:'+col+'">'+arrow+' '+(r.overnight>=0?'+':'')+r.overnight+'</div>'
       +'<div class=pgap style="color:'+r.gapColor+'">'+r.gapClass+' · '+(r.gapEmFrac>=0?'+':'')+r.gapEmFrac+'σ</div></div>'
       +'</div>';
